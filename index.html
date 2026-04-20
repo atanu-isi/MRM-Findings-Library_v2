@@ -220,26 +220,27 @@ textarea.csv-paste{min-height:160px;font-family:var(--font-mono);font-size:12px;
 .page-info{font-size:12px;color:var(--muted);font-family:var(--font-mono)}
 
 /* ── Pipeline ── */
-.pipeline{display:flex;align-items:center;gap:0;overflow-x:auto;padding:8px 2px 16px;scrollbar-width:thin}
+.pipeline{display:flex;align-items:center;gap:0;overflow-x:auto;padding:16px 2px 16px;scrollbar-width:thin}
 .pipe-step{
-  flex:1;min-width:158px;
+  flex:0 0 180px;
+  width:180px;
+  height:190px;
   background:#fff;
   border:1px solid var(--border);
   border-radius:12px;
   padding:18px 16px 16px;
-  position:relative;
   box-shadow:0 2px 6px rgba(0,0,0,.06);
   transition:box-shadow .18s,border-color .18s,transform .18s;
+  display:flex;flex-direction:column;
+  box-sizing:border-box;
 }
 .pipe-step:hover{box-shadow:0 6px 18px rgba(0,0,0,.1);border-color:var(--primary-light);transform:translateY(-3px)}
-.pipe-step-icon-wrap{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:12px}
-.pipe-step-num{font-family:var(--font-mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;margin-bottom:6px}
-.pipe-step-label{font-size:12.5px;font-weight:600;color:var(--text);line-height:1.35;margin-bottom:5px}
-.pipe-step-desc{font-size:10.5px;color:var(--muted);line-height:1.5;font-family:var(--font-mono)}
-.pipe-connector{flex-shrink:0;width:40px;display:flex;flex-direction:column;align-items:center;gap:4px;padding:0 2px}
-.pipe-connector-track{width:100%;height:2px;background:linear-gradient(90deg,var(--border-strong) 60%,transparent);position:relative}
-.pipe-connector-track::after{content:'▶';position:absolute;right:-8px;top:-6px;font-size:11px;color:var(--border-strong);line-height:1}
-.pipe-connector-tag{font-size:9px;color:var(--muted);font-family:var(--font-mono);white-space:nowrap;letter-spacing:.04em;background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:1px 5px}
+.pipe-step-icon-wrap{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;flex-shrink:0}
+.pipe-step-num{font-family:var(--font-mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;margin-bottom:5px;flex-shrink:0}
+.pipe-step-label{font-size:12.5px;font-weight:600;color:var(--text);line-height:1.35;margin-bottom:5px;flex-shrink:0}
+.pipe-step-desc{font-size:10.5px;color:var(--muted);line-height:1.5;font-family:var(--font-mono);flex:1;overflow:hidden}
+.pipe-connector{flex-shrink:0;width:36px;height:2px;background:var(--border-strong);position:relative;align-self:center}
+.pipe-connector::after{content:'▶';position:absolute;right:-9px;top:-7px;font-size:11px;color:var(--border-strong);line-height:1}
 
 /* ── Animations ── */
 @keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
@@ -892,31 +893,31 @@ function renderDashboard() {
       label:'Finding Ingestion',
       desc:'Field-weighted composite docs from all finding fields',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`,
-      bg:'#E6F3F7', color:'#005E7C', tag:'vectorise'
+      bg:'#E6F3F7', color:'#005E7C', arrow:true
     },
     {
       label:'Sublinear TF-IDF + BM25',
       desc:'Length-normalised sparse vectors, dampened term frequency',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`,
-      bg:'#FDF1EA', color:'#EA6C36', tag:'score'
+      bg:'#FDF1EA', color:'#EA6C36', arrow:true
     },
     {
       label:'Gap Stat + Silhouette Auto-k',
       desc:'Optimal cluster count via composite silhouette scoring',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3m0 12v3M3 12h3m12 0h3m-2.6-7.4-2.1 2.1M8.7 15.3 6.6 17.4M17.4 17.4l-2.1-2.1M8.7 8.7 6.6 6.6"/></svg>`,
-      bg:'#EBF8FF', color:'#2B6CB0', tag:'cluster'
+      bg:'#EBF8FF', color:'#2B6CB0', arrow:true
     },
     {
       label:'Bisecting K-Means',
       desc:'Stable semantic groups via recursive bisection',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>`,
-      bg:'#F0FFF4', color:'#38A169', tag:'assign'
+      bg:'#F0FFF4', color:'#38A169', arrow:true
     },
     {
       label:'Query & Output',
       desc:'Cosine similarity search across cluster and finding vectors',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>`,
-      bg:'#FFFFF0', color:'#D69E2E', tag:null
+      bg:'#FFFFF0', color:'#D69E2E', arrow:false
     },
   ];
   document.getElementById('pipeline-viz').innerHTML = pipeSteps.map((s,i) => `
@@ -928,10 +929,7 @@ function renderDashboard() {
       <div class="pipe-step-label">${s.label}</div>
       <div class="pipe-step-desc">${s.desc}</div>
     </div>
-    ${s.tag ? `<div class="pipe-connector">
-      <div class="pipe-connector-track"></div>
-      <div class="pipe-connector-tag">${s.tag}</div>
-    </div>` : ''}`).join('');
+    ${s.arrow ? `<div class="pipe-connector"></div>` : ''}`).join('');
 }
 // ── Findings Library ──────────────────────────────────────────────────────
 function renderFindings() {
