@@ -16,9 +16,10 @@ except ImportError:
 
 app = Flask(__name__, template_folder='.', static_folder='.', static_url_path='/')
 
-# ── Global clustering lock – prevents concurrent re-clustering races ──────────
+# ── Global clustering state ───────────────────────────────────────────────────
 _cluster_lock = threading.Lock()
-_cluster_thread = None  # reference to any in-flight background thread
+_cluster_thread = None
+_clustering_busy = False   # True while a background cluster job is running
 
 
 # ── Flask error handlers – always return JSON, never HTML ────────────────────
@@ -34,10 +35,18 @@ def json_error(e):
 findings_db = []
 clusters_db = []
 
-# ── Minimal TF-IDF vectorizer ─────────────────────────────────────────────────
-# Minimal stop-word list — intentionally lean so domain terms survive.
-# Removed generic MRM terms like "model", "risk", "finding" that were OVER-filtering.
+# ── Stop-words: generic English + MRM domain noise ───────────────────────────
+# Words that appear in virtually every MRM finding are useless for clustering —
+# they inflate frequency counts without adding discriminative signal.
+# "model", "risk", "finding", "data", "process" etc. belong in this list.
+# ── N-gram bigram extractor ───────────────────────────────────────────────────
+# Bigrams dramatically improve semantic coherence — "performance monitoring"
+# is far more discriminative than "performance" or "monitoring" alone.
+def bigrams(tokens: list) -> list:
+    return [f"{tokens[i]}_{tokens[i+1]}" for i in range(len(tokens) - 1)]
+
 STOP_WORDS = {
+    # English function words
     'a','an','the','is','are','was','were','be','been','being','have','has',
     'had','do','does','did','will','would','could','should','may','might',
     'shall','must','can','need','dare','ought','used','to','of','in','for',
@@ -53,26 +62,26 @@ STOP_WORDS = {
     'thus','hence','moreover','furthermore','additionally','based','upon',
     'lead','leads','result','results','increase','increases','lack','lacks',
     'absence','without','ensure','including','across','within','where',
-    'when','how','well','due','per','its','has','been',
+    'when','how','well','due','per','has','been','provide','provided',
+    'identify','identified','identify','identified','address','addressed',
+    'conduct','conducted','establish','established','implement','implemented',
+    'define','defined','review','reviewed','require','required','include',
+    'included','use','used','using','allow','allowed','ensure','ensure',
+    # MRM domain noise — present in virtually every finding, zero discriminative power
+    'model','models','risk','risks','finding','findings','data','process',
+    'processes','control','controls','management','framework','system',
+    'systems','current','existing','new','high','low','key','major',
+    'significant','appropriate','adequate','inadequate','insufficient',
+    'formal','informal','internal','external','related','relevant',
+    'specific','general','overall','potential','possible','likely',
+    'number','level','levels','area','areas','issue','issues','concern',
+    'concerns','requirement','requirements','standard','standards',
+    'policy','policies','procedure','procedures','practice','practices',
+    'activity','activities','report','reports','reporting','evidence',
+    'information','institution','team','teams','function','functions',
 }
 
-# ── Domain-aware field weights ────────────────────────────────────────────────
-# model_theme is the single strongest signal — weight it heavily.
-# Title is highly discriminative (concise, intent-dense).
-# Description carries the most raw semantic content for accurate separation.
-# Business justification adds supporting regulatory/risk context.
-# suggested_remediation is optional and lightly weighted to avoid skewing
-# clusters purely on action-language when the field may be absent.
-FIELD_WEIGHTS = {
-    'model_theme': 8,
-    'title': 5,
-    'description': 8,
-    'business_justification': 6,
-    'suggested_remediation': 1,
-}
-
-# ── Known MRM theme → canonical group mapping ─────────────────────────────────
-# This lets us seed clustering with structural knowledge when a theme is present.
+# ── MRM theme → canonical label (strips the word "model" prefix) ─────────────
 THEME_GROUPS = {
     'modelling input data':  'data_quality',
     'modeling input data':   'data_quality',
@@ -96,493 +105,559 @@ def normalize_theme(theme: str) -> str:
     return THEME_GROUPS.get(theme.lower().strip(), theme.lower().strip())
 
 
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
 def tokenize(text: str) -> list:
-    text = text.lower()
-    tokens = re.findall(r'\b[a-z][a-z\-]{2,}\b', text)
+    """Lowercase, extract alpha tokens >=3 chars, remove stop-words."""
+    tokens = re.findall(r'\b[a-z][a-z\-]{2,}\b', text.lower())
     return [t for t in tokens if t not in STOP_WORDS]
 
 
-def build_weighted_doc(finding: dict) -> str:
+def tokenize_with_bigrams(text: str) -> list:
+    """Return unigrams + bigrams -- richer semantic signal."""
+    uni = tokenize(text)
+    bi = [f"{uni[i]}_{uni[i+1]}" for i in range(len(uni) - 1)]
+    return uni + bi
+
+
+# ── Weighted field tokenizer ──────────────────────────────────────────────────
+# Field weights reflect actual semantic density of each field:
+#   description         — the richest source of what the finding IS about;
+#                         long, specific, full of domain vocabulary → highest weight
+#   business_justification — explains WHY it matters; regulatory language,
+#                         risk framing, consequence vocabulary → high weight
+#   title               — concise summary but often generic phrasing; useful
+#                         but should not dominate over the full-text fields
+#   suggested_remediation — action verbs, process steps; weakest discriminator
+#
+# model_theme is NOT used as a clustering signal at all — clustering is driven
+# purely by the textual content of the four fields above.  Theme is only used
+# for post-hoc label generation and k-floor anchoring.
+FIELD_WEIGHTS = {
+    'description':            6,   # Primary semantic signal — richest content
+    'business_justification': 5,   # Risk framing, regulatory context — high signal
+    'title':                  2,   # Useful hint but often generic; keep low
+    'suggested_remediation':  1,   # Action language; weakest discriminator
+}
+
+
+def weighted_token_counts(finding: dict) -> dict:
     """
-    Build a composite document string that repeats each field
-    in proportion to its weight, giving heavier fields more
-    influence on the final TF-IDF vector.
+    Return {token: weighted_count} for a single finding.
+    Includes unigrams + bigrams from all text fields.
+    model_theme is NOT used here — clustering is purely content-driven.
     """
-    parts = []
+    counts = defaultdict(float)
     for field, weight in FIELD_WEIGHTS.items():
         val = finding.get(field, '') or ''
-        # Normalise model_theme to canonical group before repeating
-        if field == 'model_theme':
-            val = normalize_theme(val)
-        parts.extend([val] * weight)
-    return ' '.join(parts)
+        for tok in tokenize_with_bigrams(val):
+            counts[tok] += weight
+    return counts
 
 
-def build_tfidf(docs: list, sublinear_tf: bool = True, bm25_b: float = 0.4):
+# ── TF-IDF vectoriser (sparse, sublinear TF) ──────────────────────────────────
+def build_tfidf(token_counts_list: list):
     """
-    TF-IDF with sublinear TF scaling and BM25-style length normalisation.
+    Build normalised TF-IDF vectors from pre-computed weighted token counts.
 
-    sublinear_tf: replaces raw TF with 1 + log(TF), which dampens the
-        dominance of very frequent terms and improves cluster separation.
-    bm25_b: length-normalisation factor (0 = off, 1 = full). A modest
-        value (0.4) penalises very long documents so that short, precise
-        field repetitions (title, model_theme) are not drowned out.
+    Uses sublinear TF (1 + log(tf)) to dampen term frequency dominance.
+    IDF uses smoothed formula: log((N+1)/(df+1)) + 1.
+    Returns: (matrix as list-of-lists, vocab list, word→index dict)
     """
-    N = len(docs)
-    tokenized = [tokenize(d) for d in docs]
+    N = len(token_counts_list)
+    # Document frequency
     df = defaultdict(int)
-    for toks in tokenized:
-        for t in set(toks):
+    for tc in token_counts_list:
+        for t in tc:
             df[t] += 1
-    vocab = list(df.keys())
+
+    # Only keep terms that appear in at least 1 doc but fewer than 95% of docs
+    # (near-universal terms are noise even after stop-word removal)
+    max_df = max(1, int(0.95 * N))
+    vocab = [t for t, d in df.items() if 1 <= d <= max_df]
     word2idx = {w: i for i, w in enumerate(vocab)}
     V = len(vocab)
 
-    # Average document length for BM25 length normalisation
-    avg_dl = sum(len(t) for t in tokenized) / max(N, 1)
-
     vectors = []
-    for toks in tokenized:
-        dl = len(toks) or 1
-        tf_raw = defaultdict(int)
-        for t in toks:
-            tf_raw[t] += 1
+    for tc in token_counts_list:
         vec = [0.0] * V
-        for t, cnt in tf_raw.items():
-            if t not in word2idx:
+        for t, wcount in tc.items():
+            idx = word2idx.get(t)
+            if idx is None:
                 continue
-            # Sublinear TF
-            tf = (1 + math.log(cnt)) if (sublinear_tf and cnt > 0) else (cnt / dl)
-            # BM25-style length normalisation applied on top of TF
-            tf_norm = tf / (1 - bm25_b + bm25_b * (dl / avg_dl))
-            idf = math.log((N + 1) / (df[t] + 1)) + 1
-            vec[word2idx[t]] = tf_norm * idf
-        norm = math.sqrt(sum(x * x for x in vec)) or 1
+            tf = 1.0 + math.log(wcount) if wcount > 0 else 0.0
+            idf = math.log((N + 1) / (df[t] + 1)) + 1.0
+            vec[idx] = tf * idf
+        # L2-normalise
+        norm = math.sqrt(sum(x * x for x in vec)) or 1.0
         vectors.append([x / norm for x in vec])
     return vectors, vocab, word2idx
 
 
-def cosine(a, b):
-    return sum(x * y for x, y in zip(a, b))
+# ── Fast dot-product (cosine on L2-normalised vectors = dot product) ──────────
+def dot(a: list, b: list) -> float:
+    return sum(a[i] * b[i] for i in range(len(a)))
 
 
-def kmeans(vectors, k, max_iter=300, n_restarts=5, seed=42):
-    """
-    K-Means with k-means++ initialisation and multiple restarts.
-    Returns the labelling with the best within-cluster inertia.
-    """
+# ── Matrix-vector multiply: all cosines at once ───────────────────────────────
+def cosine_all(matrix: list, vec: list) -> list:
+    """Return cosine similarity of vec against every row in matrix."""
+    return [dot(row, vec) for row in matrix]
+
+
+# ── K-Means++ with sparse centroid updates ────────────────────────────────────
+def kmeans(vectors: list, k: int, max_iter: int = 100, n_restarts: int = 3, seed: int = 42):
     import random
     n = len(vectors)
     if n == 0:
         return [], []
     k = min(k, n)
+    V = len(vectors[0])
 
-    best_labels = None
-    best_inertia = float('inf')
-    best_centroids = None
+    best_labels, best_inertia = None, float('inf')
 
     for restart in range(n_restarts):
-        random.seed(seed + restart * 31)
+        rng = random.Random(seed + restart * 31)
 
-        # k-means++ initialisation
-        centroids = [vectors[random.randint(0, n - 1)][:]]
+        # K-Means++ init
+        first = rng.randint(0, n - 1)
+        centroids = [vectors[first][:]]
         for _ in range(k - 1):
-            dists = []
-            for v in vectors:
-                d = min(1 - cosine(v, c) for c in centroids)
-                dists.append(max(d, 0))
-            total = sum(dists) or 1
-            r = random.random() * total
-            cum = 0
-            chosen = vectors[-1][:]
+            sims = [max(dot(v, c) for c in centroids) for v in vectors]
+            # distance = 1 - max_sim; sample proportional to distance²
+            dists = [max(0.0, 1.0 - s) ** 2 for s in sims]
+            total = sum(dists) or 1.0
+            r, cum = rng.random() * total, 0.0
+            chosen = n - 1
             for i, d in enumerate(dists):
                 cum += d
                 if cum >= r:
-                    chosen = vectors[i][:]
+                    chosen = i
                     break
-            centroids.append(chosen)
+            centroids.append(vectors[chosen][:])
 
         labels = [0] * n
         for _ in range(max_iter):
+            # Assign: for each point find closest centroid
             new_labels = []
             for v in vectors:
-                sims = [cosine(v, c) for c in centroids]
+                sims = cosine_all(centroids, v)
                 new_labels.append(sims.index(max(sims)))
             if new_labels == labels:
                 break
             labels = new_labels
-            # Recompute centroids; reinitialise empty clusters
+
+            # Update centroids
             for j in range(k):
-                members = [vectors[i] for i, l in enumerate(labels) if l == j]
-                if members:
-                    centroids[j] = [sum(col) / len(members) for col in zip(*members)]
-                else:
-                    # Empty cluster: steal the point farthest from its centroid
-                    farthest = max(range(n), key=lambda i: 1 - cosine(vectors[i], centroids[labels[i]]))
+                members = [vectors[i] for i, lbl in enumerate(labels) if lbl == j]
+                if not members:
+                    # Empty cluster: reinit to farthest point
+                    farthest = max(range(n), key=lambda i: 1.0 - dot(vectors[i], centroids[labels[i]]))
                     centroids[j] = vectors[farthest][:]
+                    continue
+                c = [sum(members[m][d] for m in range(len(members))) / len(members) for d in range(V)]
+                norm = math.sqrt(sum(x * x for x in c)) or 1.0
+                centroids[j] = [x / norm for x in c]
 
-        # Compute inertia (sum of distances to assigned centroid)
-        inertia = sum(1 - cosine(vectors[i], centroids[labels[i]]) for i in range(n))
+        inertia = sum(1.0 - dot(vectors[i], centroids[labels[i]]) for i in range(n))
         if inertia < best_inertia:
-            best_inertia = inertia
-            best_labels = labels[:]
-            best_centroids = [c[:] for c in centroids]
+            best_inertia, best_labels = inertia, labels[:]
 
-    return best_labels, best_centroids
+    return best_labels, None
 
 
-def bisecting_kmeans(vectors, k, seed=42):
+# ── Bisecting K-Means ─────────────────────────────────────────────────────────
+def bisecting_kmeans(vectors: list, k: int, seed: int = 42):
     """
-    Bisecting K-Means: repeatedly split the largest cluster using 2-means.
-
-    This avoids the random initialisation sensitivity of standard K-Means for
-    larger k values and tends to produce more balanced, semantically coherent
-    clusters.  It is especially effective when the true clusters have unequal
-    sizes, which is common in MRM finding datasets.
+    Repeatedly bisect the highest-inertia cluster until we have k clusters.
+    More stable than flat K-Means for larger k; avoids bad local minima.
     """
-    import random
     n = len(vectors)
     if n == 0:
         return [], []
     k = min(k, n)
+    V = len(vectors[0])
 
-    # Start with everything in one cluster
     clusters = [list(range(n))]
 
+    def inertia_of(idx_list):
+        if len(idx_list) <= 1:
+            return 0.0
+        vecs = [vectors[i] for i in idx_list]
+        c = [sum(v[d] for v in vecs) / len(vecs) for d in range(V)]
+        norm = math.sqrt(sum(x * x for x in c)) or 1.0
+        c = [x / norm for x in c]
+        return sum(1.0 - dot(vectors[i], c) for i in idx_list)
+
     while len(clusters) < k:
-        # Pick the largest cluster to bisect (break ties by highest inertia)
-        def cluster_inertia(idx_list):
-            if len(idx_list) <= 1:
-                return 0.0
-            vecs = [vectors[i] for i in idx_list]
-            centroid = [sum(col) / len(vecs) for col in zip(*vecs)]
-            norm = math.sqrt(sum(x * x for x in centroid)) or 1
-            centroid = [x / norm for x in centroid]
-            return sum(1 - cosine(vectors[i], centroid) for i in idx_list)
-
-        target_idx = max(range(len(clusters)),
-                         key=lambda j: (len(clusters[j]), cluster_inertia(clusters[j])))
+        # Pick cluster with highest inertia (most room to improve)
+        target_idx = max(range(len(clusters)), key=lambda j: inertia_of(clusters[j]))
         target = clusters[target_idx]
-
         if len(target) < 2:
-            break  # Cannot bisect a singleton
-
-        sub_vecs = [vectors[i] for i in target]
-        # Run 2-means with multiple restarts on the sub-cluster
-        best_labels_2, _ = kmeans(sub_vecs, 2, max_iter=100, n_restarts=3,
-                                  seed=seed + len(clusters) * 17)
-        if not best_labels_2:
             break
 
-        group_a = [target[i] for i, l in enumerate(best_labels_2) if l == 0]
-        group_b = [target[i] for i, l in enumerate(best_labels_2) if l == 1]
+        sub_vecs = [vectors[i] for i in target]
+        lbls, _ = kmeans(sub_vecs, 2, max_iter=50, n_restarts=2, seed=seed + len(clusters) * 17)
+        if not lbls:
+            break
 
-        # Reject degenerate splits (one side empty)
+        group_a = [target[i] for i, l in enumerate(lbls) if l == 0]
+        group_b = [target[i] for i, l in enumerate(lbls) if l == 1]
         if not group_a or not group_b:
             break
 
         clusters.pop(target_idx)
-        clusters.append(group_a)
-        clusters.append(group_b)
+        clusters.extend([group_a, group_b])
 
-    # Convert cluster list to a flat label array
     labels = [0] * n
-    for cluster_label, idx_list in enumerate(clusters):
+    for lbl, idx_list in enumerate(clusters):
         for i in idx_list:
-            labels[i] = cluster_label
-
+            labels[i] = lbl
     return labels, clusters
 
 
-def _silhouette_score(vectors, labels, k):
+# ── Silhouette score (sampled for speed on large datasets) ────────────────────
+def _silhouette_score(vectors: list, labels: list, k: int, max_sample: int = 200) -> float:
     """
-    Compute the mean silhouette coefficient for a clustering solution.
-    Returns a value in [-1, 1]; higher is better.
+    Mean silhouette coefficient.  Samples up to max_sample points to keep
+    O(n²) cost manageable — accurate enough for k-selection.
     """
+    import random
     n = len(vectors)
     if k <= 1 or n <= k:
         return -1.0
 
-    # Group vectors by cluster
-    clusters = defaultdict(list)
+    cluster_members = defaultdict(list)
     for i, l in enumerate(labels):
-        clusters[l].append(i)
+        cluster_members[l].append(i)
+
+    # Sample indices for scoring
+    indices = list(range(n))
+    if n > max_sample:
+        random.seed(7)
+        indices = random.sample(indices, max_sample)
 
     scores = []
-    for i, label in enumerate(labels):
-        same = [j for j in clusters[label] if j != i]
+    for i in indices:
+        lbl = labels[i]
+        same = [j for j in cluster_members[lbl] if j != i]
         if not same:
             scores.append(0.0)
             continue
-        # Mean intra-cluster distance
-        a = sum(1 - cosine(vectors[i], vectors[j]) for j in same) / len(same)
-        # Mean nearest-cluster distance
-        b_vals = []
-        for other_label, members in clusters.items():
-            if other_label == label:
-                continue
-            mean_dist = sum(1 - cosine(vectors[i], vectors[j]) for j in members) / len(members)
-            b_vals.append(mean_dist)
+        a = sum(1.0 - dot(vectors[i], vectors[j]) for j in same) / len(same)
+        b_vals = [
+            sum(1.0 - dot(vectors[i], vectors[j]) for j in members) / len(members)
+            for other_lbl, members in cluster_members.items()
+            if other_lbl != lbl and members
+        ]
         b = min(b_vals) if b_vals else 0.0
         denom = max(a, b)
-        scores.append((b - a) / denom if denom > 0 else 0.0)
+        scores.append((b - a) / denom if denom else 0.0)
 
     return sum(scores) / len(scores) if scores else -1.0
 
 
-def _gap_statistic(vectors, labels, k, n_refs=5, seed=99):
+# ---- Stable k-selection: theme-anchored with silhouette confirmation --------
+def _theme_purity(vectors: list, labels: list, findings: list) -> float:
     """
-    Compute a simplified gap statistic for the given clustering.
-
-    Gap(k) = E[log W_k_ref] - log W_k
-    where W_k is the within-cluster dispersion (sum of pairwise distances
-    within clusters / 2*cluster_size) and W_k_ref is the same for random
-    uniform reference datasets.
-
-    A higher gap indicates that the clustering is meaningfully better than
-    a random partition, signalling a good k.
+    Fraction of findings that share their cluster's dominant theme.
+    A pure cluster has all findings from the same theme.
+    Higher is better (max 1.0).
     """
-    import random
-
-    def wcss(vecs, lbls, num_k):
-        """Within-cluster sum of squared cosine distances."""
-        total = 0.0
-        for j in range(num_k):
-            members = [vecs[i] for i, l in enumerate(lbls) if l == j]
-            if len(members) < 2:
-                continue
-            # Sum of pairwise distances / (2 * |C|)
-            s = sum(1 - cosine(members[a], members[b])
-                    for a in range(len(members))
-                    for b in range(a + 1, len(members)))
-            total += s / (2 * len(members))
-        return total or 1e-9
-
-    W = wcss(vectors, labels, k)
-
-    # Generate reference distributions: uniform samples in the feature hypercube
-    dim = len(vectors[0]) if vectors else 1
-    rng = random.Random(seed)
-    ref_logs = []
-    for _ in range(n_refs):
-        ref_vecs = [[rng.uniform(-1, 1) for _ in range(dim)] for _ in range(len(vectors))]
-        # Normalise
-        ref_vecs = [[x / (math.sqrt(sum(v ** 2 for v in rv)) or 1) for x in rv] for rv in ref_vecs]
-        ref_labels, _ = kmeans(ref_vecs, k, max_iter=50, n_restarts=1, seed=seed + _)
-        if ref_labels:
-            ref_logs.append(math.log(wcss(ref_vecs, ref_labels, k)))
-    if not ref_logs:
-        return 0.0
-    return sum(ref_logs) / len(ref_logs) - math.log(W)
+    cluster_themes = defaultdict(list)
+    for i, (lbl, f) in enumerate(zip(labels, findings)):
+        t = normalize_theme(f.get('model_theme', ''))
+        cluster_themes[lbl].append(t)
+    purity = 0.0
+    for lbl, themes in cluster_themes.items():
+        if not themes:
+            continue
+        dominant_count = max(themes.count(t) for t in set(themes)) if themes else 0
+        purity += dominant_count
+    return purity / len(findings) if findings else 0.0
 
 
-def _auto_select_k(vectors, n: int, has_themes: bool, theme_count: int) -> int:
+def _auto_select_k(vectors: list, n: int, theme_count: int, findings: list = None) -> int:
     """
-    Determine the optimal number of clusters using a combined
-    silhouette + gap-statistic approach.
+    Stable k-selection using a composite score:
+      score = 0.5 * silhouette + 0.5 * theme_purity - 0.003 * k
 
-    Strategy:
-    1. Run silhouette scoring across the candidate k range using bisecting
-       K-Means (more stable than standard K-Means for auto-k selection).
-    2. Compute the gap statistic for each candidate k to confirm that the
-       chosen partition is meaningfully better than random.
-    3. Pick the k that maximises a weighted composite of both scores,
-       with a mild preference for compactness (smaller k) to avoid
-       over-fragmentation on real-world MRM finding sets.
+    The theme-purity term anchors k near the number of distinct themes,
+    preventing the cluster count from changing when new findings are added
+    (as long as they belong to existing themes).
 
-    Falls back gracefully for very small datasets.
+    k_floor = max(theme_count, 2) ensures we never produce fewer clusters
+    than there are distinct themes in the corpus.
     """
     if n <= 2:
         return 1
-    if n == 3:
+    if n <= 3:
         return 2
 
-    # Define search range based on dataset size
+    # Hard floor: never fewer clusters than distinct themes (semantic anchoring)
+    k_floor = max(2, theme_count) if theme_count else 2
+
     if n <= 10:
-        k_min, k_max = 2, max(2, n - 1)
-    elif n <= 50:
-        k_min, k_max = 2, min(12, n // 2)
-    elif n <= 200:
-        k_min, k_max = 2, min(25, n // 5)
+        k_min, k_max = k_floor, min(n - 1, max(k_floor + 2, 5))
+    elif n <= 30:
+        k_min, k_max = k_floor, min(n // 2, max(k_floor + 3, 8))
+    elif n <= 100:
+        k_min, k_max = k_floor, min(n // 4, max(k_floor + 4, 12))
     else:
-        k_min, k_max = 2, min(50, n // 10)
+        k_min, k_max = k_floor, min(n // 8, max(k_floor + 5, 20))
 
-    # If themes exist, include theme_count as a strong candidate
-    if has_themes and theme_count >= k_min:
-        k_max = max(k_max, min(theme_count + 2, n - 1))
+    k_max = max(k_max, k_min + 1)
 
-    best_k = k_min
-    best_composite = -float('inf')
-
-    sil_scores = {}
-    gap_scores = {}
+    best_k, best_score = k_min, -float('inf')
+    no_improve = 0
+    prev_clusters = [list(range(n))]
 
     for k in range(k_min, k_max + 1):
-        # Use bisecting K-Means for the primary k selection pass —
-        # it is deterministic and avoids bad local minima.
-        labels, _ = bisecting_kmeans(vectors, k)
-        if not labels:
-            continue
+        # Grow cluster list incrementally (reuse previous work)
+        while len(prev_clusters) < k:
+            V = len(vectors[0])
+
+            def inertia_of(idx_list, _V=V):
+                if len(idx_list) <= 1:
+                    return 0.0
+                vecs = [vectors[i] for i in idx_list]
+                c = [sum(v[d] for v in vecs) / len(vecs) for d in range(_V)]
+                norm = math.sqrt(sum(x * x for x in c)) or 1.0
+                c = [x / norm for x in c]
+                return sum(1.0 - dot(vectors[i], c) for i in idx_list)
+
+            target_idx = max(range(len(prev_clusters)),
+                             key=lambda j: inertia_of(prev_clusters[j]))
+            target = prev_clusters[target_idx]
+            if len(target) < 2:
+                break
+            sub_vecs = [vectors[i] for i in target]
+            lbls, _ = kmeans(sub_vecs, 2, max_iter=50, n_restarts=2,
+                             seed=42 + len(prev_clusters) * 17)
+            if not lbls:
+                break
+            ga = [target[i] for i, l in enumerate(lbls) if l == 0]
+            gb = [target[i] for i, l in enumerate(lbls) if l == 1]
+            if not ga or not gb:
+                break
+            prev_clusters.pop(target_idx)
+            prev_clusters.extend([ga, gb])
+
+        if len(prev_clusters) < k:
+            break
+
+        labels = [0] * n
+        for lbl, idx_list in enumerate(prev_clusters):
+            for i in idx_list:
+                labels[i] = lbl
 
         sil = _silhouette_score(vectors, labels, k)
-        sil_scores[k] = sil
+        purity = _theme_purity(vectors, labels, findings or []) if findings else 0.5
+        # Composite: silhouette measures geometric quality, purity measures
+        # semantic coherence; tiny penalty discourages unnecessary splits
+        score = 0.50 * sil + 0.50 * purity - 0.003 * k
 
-        # Only compute gap for the plausible top candidates to keep it fast.
-        # Use n_refs=3 for speed; accuracy is sufficient for our range sizes.
-        gap = _gap_statistic(vectors, labels, k, n_refs=3)
-        gap_scores[k] = gap
-
-    if not sil_scores:
-        return k_min
-
-    # Normalise both scores to [0, 1] for the composite
-    sil_min, sil_max = min(sil_scores.values()), max(sil_scores.values())
-    gap_min, gap_max = min(gap_scores.values()), max(gap_scores.values())
-
-    def norm(val, lo, hi):
-        return (val - lo) / (hi - lo) if hi > lo else 0.5
-
-    for k in range(k_min, k_max + 1):
-        if k not in sil_scores:
-            continue
-        s_norm = norm(sil_scores[k], sil_min, sil_max)
-        g_norm = norm(gap_scores[k], gap_min, gap_max)
-        # Weight silhouette slightly higher; add a tiny compactness penalty
-        composite = 0.6 * s_norm + 0.4 * g_norm - 0.005 * k
-        if composite > best_composite:
-            best_composite = composite
-            best_k = k
+        if score > best_score + 0.003:
+            best_score, best_k = score, k
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= 3:
+                break
 
     return best_k
 
 
-def _estimate_k(vectors, n: int, has_themes: bool) -> int:
+# ── Semantic cluster label: dominant theme + top discriminative bigrams ────────
+def _cluster_label(fids: list, all_clusters_fids: list) -> str:
     """
-    Determine optimal k automatically using silhouette scoring.
-    - Counts distinct canonical theme groups as a hint for the search range.
-    - Runs silhouette analysis across the plausible k range.
-    - Returns the k that maximises cluster cohesion/separation.
+    Generate a human-readable semantic label for a cluster.
+    Returns: "<DominantTheme>: <top bigram phrase>, <second bigram phrase>"
     """
-    theme_count = 0
-    if has_themes:
-        themes = set()
-        for f in findings_db:
-            t = normalize_theme(f.get('model_theme', ''))
-            if t:
-                themes.add(t)
-        theme_count = len(themes)
-
-    return _auto_select_k(vectors, n, has_themes, theme_count)
-
-
-def _top_signals(fids):
-    texts = []
-    for fid in fids:
-        f = next((x for x in findings_db if x['finding_id'] == fid), None)
-        if f:
-            texts.append(build_weighted_doc(f))
-    tokens = []
-    for t in texts:
-        tokens.extend(tokenize(t))
-    freq = defaultdict(int)
-    for t in tokens:
-        freq[t] += 1
-    top = sorted(freq, key=lambda x: -freq[x])[:10]
-    return ', '.join(top)
-
-
-def _generate_why(fids):
+    fid_set = {f['finding_id']: f for f in findings_db}
+    # Dominant theme
     themes = []
     for fid in fids:
-        f = next((x for x in findings_db if x['finding_id'] == fid), None)
+        f = fid_set.get(fid)
+        if f and f.get('model_theme'):
+            themes.append(normalize_theme(f['model_theme']))
+    dominant_theme = ''
+    if themes:
+        dominant_theme = max(set(themes), key=themes.count)
+        dominant_theme = dominant_theme.replace('_', ' ').title()
+
+    # Top discriminative bigrams (prefer bigrams over unigrams for readability)
+    freq_in = defaultdict(float)
+    for fid in fids:
+        f = fid_set.get(fid)
+        if not f:
+            continue
+        tc = weighted_token_counts(f)
+        for tok, wc in tc.items():
+            if '_' in tok and not tok.endswith('_seed'):   # bigrams only
+                freq_in[tok] += wc
+
+    # IDF-weight against other clusters to find discriminative bigrams
+    all_fids_flat = [fid for cluster in all_clusters_fids for fid in cluster]
+    freq_all = defaultdict(float)
+    for fid in all_fids_flat:
+        f = fid_set.get(fid)
+        if not f:
+            continue
+        tc = weighted_token_counts(f)
+        for tok, wc in tc.items():
+            if '_' in tok and not tok.endswith('_seed'):
+                freq_all[tok] += wc
+
+    n_clusters = max(1, len(all_clusters_fids))
+    tfidf_bigrams = {}
+    for tok, freq in freq_in.items():
+        # Simple TF-IDF: normalize by cluster size, penalize globally common terms
+        tf = freq / max(1, len(fids))
+        idf = math.log(n_clusters / max(1, sum(1 for cl in all_clusters_fids
+                                                if any(weighted_token_counts(fid_set.get(fid, {})).get(tok, 0) > 0
+                                                       for fid in cl))))
+        tfidf_bigrams[tok] = tf * idf
+
+    top_bi = sorted(tfidf_bigrams, key=lambda x: -tfidf_bigrams[x])[:2]
+    phrase = ', '.join(t.replace('_', ' ') for t in top_bi)
+
+    if dominant_theme and phrase:
+        return f"{dominant_theme}: {phrase}"
+    elif dominant_theme:
+        return dominant_theme
+    return phrase or 'Mixed'
+
+
+def _top_signals(fids: list) -> str:
+    """
+    Return top 12 discriminative tokens (bigrams preferred) for a cluster,
+    excluding seed tokens and common noise.
+    """
+    freq = defaultdict(float)
+    fid_set = {f['finding_id']: f for f in findings_db}
+    for fid in fids:
+        f = fid_set.get(fid)
+        if not f:
+            continue
+        tc = weighted_token_counts(f)
+        for tok, wc in tc.items():
+            if not tok.endswith('_seed'):
+                freq[tok] += wc
+    # Prefer bigrams (more semantic), then unigrams
+    bigram_tokens = sorted(
+        [t for t in freq if '_' in t], key=lambda x: -freq[x])[:6]
+    unigram_tokens = sorted(
+        [t for t in freq if '_' not in t], key=lambda x: -freq[x])[:6]
+    top = bigram_tokens + [u for u in unigram_tokens if u not in bigram_tokens]
+    return ', '.join(t.replace('_', ' ') for t in top[:12])
+
+
+def _generate_why(fids: list, label: str = '') -> str:
+    themes = []
+    fid_set = {f['finding_id']: f for f in findings_db}
+    for fid in fids:
+        f = fid_set.get(fid)
         if f and f.get('model_theme'):
             themes.append(f['model_theme'])
     theme_str = ''
     if themes:
         unique = list(dict.fromkeys(themes))
         theme_str = f" under the theme(s): {', '.join(unique)}."
+    label_str = f" Semantic label: '{label}'." if label else ''
     return (
-        f"Findings {', '.join(fids)} share overlapping concepts in their title, "
-        f"description, and business justifications{theme_str} "
-        "Bisecting K-Means clustering (with sublinear TF-IDF and BM25 length normalisation) "
-        "detected strong semantic similarity in vocabulary, risk focus, and field content across all relevant fields."
+        f"Findings {', '.join(fids)} share overlapping vocabulary and risk focus"
+        f"{theme_str}{label_str} Bisecting K-Means on sublinear TF-IDF vectors "
+        "(description×6 + business justification×5 + title×2 + remediation×1, "
+        "with bigrams) detected strong semantic similarity purely from finding content — "
+        "model_theme is not used as a clustering signal."
     )
 
 
 def _do_clustering(k: int = None):
     """Actual clustering work – runs in a background thread."""
-    global clusters_db
-    if not findings_db:
+    global clusters_db, _clustering_busy
+    _clustering_busy = True
+    try:
+        if not findings_db:
+            with _cluster_lock:
+                clusters_db = []
+            return
+
+        n = len(findings_db)
+
+        # Build per-finding token→weighted_count dicts (model_theme excluded)
+        token_counts = [weighted_token_counts(f) for f in findings_db]
+        vectors, vocab, word2idx = build_tfidf(token_counts)
+
+        # Count distinct canonical themes as a k hint
+        theme_set = set()
+        for f in findings_db:
+            t = normalize_theme(f.get('model_theme', ''))
+            if t:
+                theme_set.add(t)
+        theme_count = len(theme_set)
+
+        if k is None:
+            k = _auto_select_k(vectors, n, theme_count, findings_db)
+        k = min(k, n)
+
+        # Bisecting K-Means — stable, avoids local minima for larger k
+        labels, _ = bisecting_kmeans(vectors, k)
+        if not labels:
+            labels, _ = kmeans(vectors, k)
+
+        cluster_map = defaultdict(list)
+        for i, label in enumerate(labels):
+            cluster_map[label].append(findings_db[i]['finding_id'])
+
+        # Sort clusters by dominant MRM theme for stable, readable labelling
+        theme_order = ['data_quality', 'documentation', 'governance',
+                       'methodology', 'performance_monitoring', 'implementation']
+        fid_lookup = {f['finding_id']: f for f in findings_db}
+
+        def theme_sort_key(fids):
+            counts = defaultdict(int)
+            for fid in fids:
+                f = fid_lookup.get(fid)
+                if f:
+                    counts[normalize_theme(f.get('model_theme', ''))] += 1
+            dominant = max(counts, key=counts.get) if counts else ''
+            try:
+                return theme_order.index(dominant)
+            except ValueError:
+                return 99
+
+        sorted_clusters = sorted(cluster_map.values(), key=theme_sort_key)
+        all_clusters_fids = list(sorted_clusters)
+
+        new_clusters = []
+        for idx, fids in enumerate(sorted_clusters):
+            label = _cluster_label(fids, all_clusters_fids)
+            new_clusters.append({
+                'cluster_id': f"C{idx + 1}",
+                'findings_included': fids,
+                'why_grouped': _generate_why(fids, label),
+                'semantic_signals': _top_signals(fids),
+                'semantic_label': label,
+                'size': len(fids),
+            })
+
         with _cluster_lock:
-            clusters_db = []
-        return
-
-    # Determine whether model_theme is available
-    has_themes = any(f.get('model_theme') for f in findings_db)
-
-    # Build weighted composite documents using all fields
-    docs = [build_weighted_doc(f) for f in findings_db]
-
-    vectors, vocab, word2idx = build_tfidf(docs)
-    n = len(findings_db)
-
-    if k is None:
-        k = _estimate_k(vectors, n, has_themes)
-    k = min(k, n)
-
-    # Primary algorithm: bisecting K-Means — more stable and better at
-    # separating theme-distinct clusters than a single K-Means run.
-    labels, _ = bisecting_kmeans(vectors, k)
-
-    # Fallback: if bisecting K-Means returns no labels, use standard K-Means
-    if not labels:
-        labels, _ = kmeans(vectors, k)
-
-    cluster_map = defaultdict(list)
-    for i, label in enumerate(labels):
-        cluster_map[label].append(findings_db[i]['finding_id'])
-
-    # ── Optional: sort clusters by dominant model_theme for stable labelling ──
-    def cluster_theme_sort_key(fids):
-        theme_counts = defaultdict(int)
-        for fid in fids:
-            f = next((x for x in findings_db if x['finding_id'] == fid), None)
-            if f:
-                theme_counts[normalize_theme(f.get('model_theme', ''))] += 1
-        dominant = max(theme_counts, key=theme_counts.get) if theme_counts else ''
-        theme_order = ['data_quality', 'documentation', 'governance', 'methodology', 'performance_monitoring']
-        try:
-            return theme_order.index(dominant)
-        except ValueError:
-            return 99
-
-    sorted_clusters = sorted(cluster_map.values(), key=cluster_theme_sort_key)
-
-    new_clusters = []
-    for idx, fids in enumerate(sorted_clusters):
-        new_clusters.append({
-            'cluster_id': f"C{idx + 1}",
-            'findings_included': fids,
-            'why_grouped': _generate_why(fids),
-            'semantic_signals': _top_signals(fids),
-            'size': len(fids),
-        })
-
-    with _cluster_lock:
-        clusters_db[:] = new_clusters
+            clusters_db[:] = new_clusters
+    finally:
+        _clustering_busy = False
 
 
 def run_clustering(k: int = None, background: bool = True):
     """
-    Kick off clustering.  By default runs in a daemon background thread so
-    upload/add routes return instantly.  Pass background=False for the
+    Kick off clustering. By default runs in a daemon background thread so
+    upload/add routes return instantly. Pass background=False for the
     initial seed load at startup (blocking is fine there).
     """
     global _cluster_thread
     if not background:
         _do_clustering(k)
         return
-    # Cancel any pending thread (it will finish on its own but we don't wait)
     t = threading.Thread(target=_do_clustering, args=(k,), daemon=True)
     _cluster_thread = t
     t.start()
@@ -591,22 +666,25 @@ def run_clustering(k: int = None, background: bool = True):
 def search_query(query: str) -> dict:
     if not clusters_db or not findings_db:
         return {'cluster': None, 'findings': [], 'score': 0}
-    docs = [build_weighted_doc(f) for f in findings_db]
-    all_docs = docs + [query]
-    vectors, vocab, word2idx = build_tfidf(all_docs)
+
+    # Vectorise findings + query together so IDF is computed over the same corpus
+    query_tc = {tok: 1.0 for tok in tokenize(query)}
+    all_tcs = [weighted_token_counts(f) for f in findings_db] + [query_tc]
+    vectors, _, _ = build_tfidf(all_tcs)
     q_vec = vectors[-1]
     doc_vecs = vectors[:-1]
-    sims = [(cosine(q_vec, dv), i) for i, dv in enumerate(doc_vecs)]
+
+    sims = [(dot(q_vec, dv), i) for i, dv in enumerate(doc_vecs)]
     sims.sort(reverse=True)
     top_findings = [findings_db[i] for _, i in sims[:5]]
     top_ids = {f['finding_id'] for f in top_findings}
-    best_cluster = None
-    best_count = 0
+
+    best_cluster, best_count = None, 0
     for c in clusters_db:
         overlap = len(set(c['findings_included']) & top_ids)
         if overlap > best_count:
-            best_count = overlap
-            best_cluster = c
+            best_count, best_cluster = overlap, c
+
     return {
         'cluster': best_cluster,
         'findings': top_findings,
@@ -771,6 +849,12 @@ def delete_finding(fid):
 @app.route('/api/clusters', methods=['GET'])
 def get_clusters():
     return jsonify(clusters_db)
+
+
+@app.route('/api/clusters/status', methods=['GET'])
+def clusters_status():
+    """Lightweight poll endpoint — returns whether clustering is still running."""
+    return jsonify({'busy': _clustering_busy, 'count': len(clusters_db)})
 
 
 @app.route('/api/clusters/rerun', methods=['POST'])
