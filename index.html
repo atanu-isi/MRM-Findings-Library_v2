@@ -795,6 +795,64 @@ async function loadAll() {
   updateSidebar();
 }
 
+// ── Cluster polling ───────────────────────────────────────────────────────
+let _pollTimer = null;
+
+function showClusterBanner(msg) {
+  let b = document.getElementById('cluster-banner');
+  if (!b) {
+    b = document.createElement('div');
+    b.id = 'cluster-banner';
+    b.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);' +
+      'background:#005E7C;color:#fff;padding:9px 20px;border-radius:8px;font-size:13px;' +
+      'font-weight:500;z-index:9999;box-shadow:0 4px 14px rgba(0,0,0,.18);' +
+      'display:flex;align-items:center;gap:10px;transition:opacity .3s';
+    document.body.appendChild(b);
+  }
+  b.innerHTML = '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;' +
+    'border:2px solid #fff;border-top-color:transparent;animation:spin .7s linear infinite"></span>' +
+    msg;
+  b.style.opacity = '1';
+  // Ensure spin keyframe exists
+  if (!document.getElementById('spin-style')) {
+    const s = document.createElement('style');
+    s.id = 'spin-style';
+    s.textContent = '@keyframes spin{to{transform:rotate(360deg)}}';
+    document.head.appendChild(s);
+  }
+}
+
+function hideClusterBanner() {
+  const b = document.getElementById('cluster-banner');
+  if (b) { b.style.opacity = '0'; setTimeout(() => b.remove(), 350); }
+}
+
+async function pollUntilClustered(onDone) {
+  clearTimeout(_pollTimer);
+  showClusterBanner('Re-clustering findings\u2026');
+  const check = async () => {
+    try {
+      const s = await apiFetch('/api/clusters/status');
+      if (!s.busy) {
+        // Clustering done — refresh clusters and update UI
+        allClusters = await apiFetch('/api/clusters');
+        updateSidebar();
+        renderClusters();
+        renderFindings();
+        renderDashboard();
+        hideClusterBanner();
+        if (onDone) onDone(s.count);
+      } else {
+        _pollTimer = setTimeout(check, 800);
+      }
+    } catch(e) {
+      hideClusterBanner();
+    }
+  };
+  // Give the thread a moment to start, then begin polling
+  _pollTimer = setTimeout(check, 400);
+}
+
 function updateSidebar() {
   document.getElementById('s-findings').textContent = allFindings.length;
   document.getElementById('s-clusters').textContent = allClusters.length;
@@ -872,15 +930,16 @@ function renderDashboard() {
         const themes = [...new Set(c.findings_included
           .map(fid => allFindings.find(f=>f.finding_id===fid))
           .filter(Boolean).map(f=>f.model_theme).filter(Boolean))];
-        const signals = (c.semantic_signals||'').split(',').slice(0,4).map(s=>s.trim()).join(' · ');
+        const signals = (c.semantic_signals||'').split(',').slice(0,3).map(s=>s.trim()).join(' · ');
+        const label = c.semantic_label || '';
         return `<div onclick="openClusterModal('${c.cluster_id}')" style="display:flex;align-items:center;gap:12px;padding:11px 20px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s;${i===allClusters.length-1?'border-bottom:none':''}" onmouseover="this.style.background='var(--bg)'" onmouseout="this.style.background=''">
           <div style="width:9px;height:9px;border-radius:50%;background:${color};flex-shrink:0"></div>
           <div style="flex:1;min-width:0">
-            <div style="display:flex;align-items:center;gap:7px;margin-bottom:2px">
+            <div style="display:flex;align-items:center;gap:7px;margin-bottom:2px;flex-wrap:wrap">
               <span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:${color}">${c.cluster_id}</span>
               <span style="font-size:11px;color:var(--text-secondary);font-weight:500">${c.size} finding${c.size!==1?'s':''}</span>
               <span style="font-size:10px;color:var(--muted);font-family:var(--font-mono)">(${allFindings.length?((c.size/allFindings.length)*100).toFixed(0):0}%)</span>
-              ${themes[0] ? `<span style="font-size:10px;color:var(--text-secondary);background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:1px 6px;font-family:var(--font-mono);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${themes[0]}</span>` : ''}
+              ${label ? `<span style="font-size:10px;color:var(--primary);background:var(--primary-bg);border:1px solid var(--primary)33;border-radius:3px;padding:1px 6px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${label}">${label}</span>` : ''}
             </div>
             <div style="font-size:10px;color:var(--muted);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Signals: ${signals||'—'}</div>
           </div>
@@ -896,32 +955,32 @@ function renderDashboard() {
   // ── Pipeline ──────────────────────────────────────────────────────────
   const pipeSteps = [
     {
-      label:'Finding Ingestion',
-      desc:'Field-weighted composite docs from all finding fields',
+      label:'Content-Weighted Ingestion',
+      desc:'Description×6, Business Justification×5, Title×2, Remediation×1 — no theme signal used',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`,
       bg:'#E6F3F7', color:'#005E7C', arrow:true
     },
     {
-      label:'Sublinear TF-IDF + BM25',
-      desc:'Length-normalised sparse vectors, dampened term frequency',
+      label:'Sublinear TF-IDF (Bigrams)',
+      desc:'Unigram + bigram vectors, L2-normalised, 95% max-df pruning',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`,
       bg:'#FDF1EA', color:'#EA6C36', arrow:true
     },
     {
-      label:'Gap Stat + Silhouette Auto-k',
-      desc:'Optimal cluster count via composite silhouette scoring',
+      label:'Theme-Anchored k-Selection',
+      desc:'k ≥ distinct themes; score = 0.5×silhouette + 0.5×theme-purity − 0.003k',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3m0 12v3M3 12h3m12 0h3m-2.6-7.4-2.1 2.1M8.7 15.3 6.6 17.4M17.4 17.4l-2.1-2.1M8.7 8.7 6.6 6.6"/></svg>`,
       bg:'#EBF8FF', color:'#2B6CB0', arrow:true
     },
     {
       label:'Bisecting K-Means',
-      desc:'Stable semantic groups via recursive bisection',
+      desc:'Stable semantic groups via recursive bisection + cosine similarity',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>`,
       bg:'#F0FFF4', color:'#38A169', arrow:true
     },
     {
-      label:'Query & Output',
-      desc:'Cosine similarity search across cluster and finding vectors',
+      label:'Semantic Label Output',
+      desc:'Dominant theme (post-hoc) + discriminative bigrams → human-readable cluster label',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>`,
       bg:'#FFFFF0', color:'#D69E2E', arrow:false
     },
@@ -1010,6 +1069,7 @@ function renderClusters() {
           <div class="cluster-card-accent" style="background:var(--cluster-${ci%6+1},var(--primary))"></div>
           <div class="cluster-card-inner">
             <div class="cluster-id c-color-${ci}">${c.cluster_id} <span style="font-weight:400;color:var(--muted)">· ${c.findings_included.length} finding${c.findings_included.length!==1?'s':''}</span></div>
+            ${c.semantic_label ? `<div style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;padding:3px 7px;background:var(--bg);border-radius:4px;border-left:2px solid var(--cluster-${ci%6+1},var(--primary));display:inline-block">${c.semantic_label}</div>` : ''}
             <div class="cluster-findings">
               ${c.findings_included.map(fid => `<span class="tag tag-id" style="font-size:10px">${fid}</span>`).join('')}
             </div>
@@ -1130,9 +1190,13 @@ async function addFinding() {
   try {
     const res = await apiFetch('/api/findings', {method:'POST', body:JSON.stringify(data)});
     if (res.error) { showAlert(res.error, 'error'); return; }
-    await loadAll();
+    allFindings = await apiFetch('/api/findings');
+    updateSidebar();
     clearForm();
-    showAlert('Finding ' + data.finding_id + ' added. Library now has ' + res.total + ' findings. Clusters updating\u2026', 'success');
+    showAlert('Finding ' + data.finding_id + ' added (' + res.total + ' total). Clustering\u2026', 'success');
+    pollUntilClustered(function(count) {
+      showAlert('Clustering complete \u2014 ' + count + ' clusters ready.', 'success');
+    });
   } catch(e) {
     showAlert('Error: ' + e.message, 'error');
   }
@@ -1148,11 +1212,13 @@ function clearForm() {
 }
 
 async function deleteFinding(fid) {
-  if (!confirm(`Delete finding ${fid}? This will trigger re-clustering.`)) return;
-  await apiFetch(`/api/findings/${fid}`, {method:'DELETE'});
-  await loadAll();
+  if (!confirm('Delete finding ' + fid + '? This will trigger re-clustering.')) return;
+  await apiFetch('/api/findings/' + fid, {method:'DELETE'});
+  allFindings = await apiFetch('/api/findings');
+  updateSidebar();
   renderFindings();
-  showAlert(`Finding ${fid} deleted`, 'success');
+  showAlert('Finding ' + fid + ' deleted. Re-clustering\u2026', 'success');
+  pollUntilClustered(null);
 }
 
 // ── File Upload ──────────────────────────────────────────────────────────
@@ -1229,11 +1295,15 @@ async function uploadFile() {
     if (data.error) {
       resultEl.innerHTML = '<div class="alert alert-error">\u2717 ' + data.error + '</div>';
     } else {
-      await loadAll();
+      // Refresh findings immediately; clusters will arrive via poll
+      allFindings = await apiFetch('/api/findings');
+      updateSidebar();
       resultEl.innerHTML =
-        '<div class="alert alert-success">\u2713 Added ' + data.added + ' findings (' + data.skipped + ' skipped). Total: ' + data.total + '.' +
-        ' <span style="font-size:11px;opacity:.8">Clusters updating in background\u2026</span></div>';
+        '<div class="alert alert-success">\u2713 Added ' + data.added + ' findings (' + data.skipped + ' skipped). Total: ' + data.total + '.</div>';
       clearFileUpload();
+      pollUntilClustered(function(count) {
+        showAlert('Clustering complete \u2014 ' + count + ' clusters ready.', 'success');
+      });
     }
   } catch(e) {
     resultEl.innerHTML = '<div class="alert alert-error">\u2717 Upload failed: ' + e.message + '</div>';
@@ -1292,18 +1362,26 @@ async function importCSV() {
   }).filter(Boolean);
   if (!rows.length) { showAlert('No valid rows found', 'error'); return; }
   const res = await apiFetch('/api/findings/bulk', {method:'POST', body:JSON.stringify(rows)});
-  await loadAll();
-  document.getElementById('import-result').innerHTML = `<div class="alert alert-success">✓ Added ${res.added} findings (${res.skipped} skipped). Total: ${res.total}</div>`;
+  allFindings = await apiFetch('/api/findings');
+  updateSidebar();
+  document.getElementById('import-result').innerHTML = '<div class="alert alert-success">\u2713 Added ' + res.added + ' findings (' + res.skipped + ' skipped). Total: ' + res.total + '.</div>';
+  pollUntilClustered(function(count) {
+    showAlert('Clustering complete \u2014 ' + count + ' clusters ready.', 'success');
+  });
 }
 
 async function importJSON() {
   try {
     const data = JSON.parse(document.getElementById('json-input').value);
     const res = await apiFetch('/api/findings/bulk', {method:'POST', body:JSON.stringify(data)});
-    await loadAll();
-    document.getElementById('import-result-json').innerHTML = `<div class="alert alert-success">✓ Added ${res.added} findings (${res.skipped} skipped). Total: ${res.total}</div>`;
+    allFindings = await apiFetch('/api/findings');
+    updateSidebar();
+    document.getElementById('import-result-json').innerHTML = '<div class="alert alert-success">\u2713 Added ' + res.added + ' findings (' + res.skipped + ' skipped). Total: ' + res.total + '.</div>';
+    pollUntilClustered(function(count) {
+      showAlert('Clustering complete \u2014 ' + count + ' clusters ready.', 'success');
+    });
   } catch(e) {
-    document.getElementById('import-result-json').innerHTML = `<div class="alert alert-error">✗ Invalid JSON: ${e.message}</div>`;
+    document.getElementById('import-result-json').innerHTML = '<div class="alert alert-error">\u2717 Invalid JSON: ' + e.message + '</div>';
   }
 }
 
@@ -1358,18 +1436,22 @@ function openClusterModal(cid) {
   if (!c) return;
   const ci = clusterColorIdx(cid);
   document.getElementById('modal-badge').textContent = cid;
-  document.getElementById('modal-title').textContent = `Cluster ${cid}`;
+  document.getElementById('modal-title').textContent = c.semantic_label ? `${cid} — ${c.semantic_label}` : `Cluster ${cid}`;
   const members = c.findings_included.map(fid => {
     const f = allFindings.find(x => x.finding_id === fid);
     return f ? `<div class="finding-item">
-      <div class="fi-header"><span class="tag tag-id">${f.finding_id}</span></div>
+      <div class="fi-header"><span class="tag tag-id">${f.finding_id}</span>${f.model_theme ? `<span class="tag tag-success" style="font-size:10px;margin-left:6px">${f.model_theme}</span>` : ''}</div>
       <div class="fi-title">${f.title}</div>
       <div class="fi-desc">${f.description.substring(0,200)}…</div>
     </div>` : '';
   }).join('');
   document.getElementById('modal-content').innerHTML = `
+    ${c.semantic_label ? `<div class="modal-section">
+      <h4>Semantic Label</h4>
+      <p style="font-size:13px;font-weight:600;color:var(--primary);padding:8px 12px;background:var(--primary-bg);border-radius:6px;border-left:3px solid var(--primary)">${c.semantic_label}</p>
+    </div>` : ''}
     <div class="modal-section">
-      <h4>Semantic Signals</h4>
+      <h4>Semantic Signals (bigrams + unigrams)</h4>
       <p style="font-family:var(--font-mono);font-size:12px;background:var(--bg);padding:10px;border-radius:6px;border:1px solid var(--border);line-height:1.7">${c.semantic_signals}</p>
     </div>
     <div class="modal-section">
