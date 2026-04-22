@@ -778,6 +778,12 @@ function showPanel(name, el) {
 // ── API ──────────────────────────────────────────────────────────────────────
 async function apiFetch(url, opts={}) {
   const res = await fetch(url, {headers:{'Content-Type':'application/json'}, ...opts});
+  const ct = res.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) {
+    const text = await res.text();
+    const msg = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+    throw new Error('Server error ' + res.status + ': ' + msg);
+  }
   return res.json();
 }
 
@@ -1121,11 +1127,15 @@ async function addFinding() {
   if (!data.finding_id || !data.title || !data.description || !data.business_justification) {
     showAlert('All fields are required', 'error'); return;
   }
-  const res = await apiFetch('/api/findings', {method:'POST', body:JSON.stringify(data)});
-  if (res.error) { showAlert(res.error, 'error'); return; }
-  await loadAll();
-  clearForm();
-  showAlert(`Finding ${data.finding_id} added. Library now has ${res.total} findings.`, 'success');
+  try {
+    const res = await apiFetch('/api/findings', {method:'POST', body:JSON.stringify(data)});
+    if (res.error) { showAlert(res.error, 'error'); return; }
+    await loadAll();
+    clearForm();
+    showAlert('Finding ' + data.finding_id + ' added. Library now has ' + res.total + ' findings. Clusters updating\u2026', 'success');
+  } catch(e) {
+    showAlert('Error: ' + e.message, 'error');
+  }
 }
 
 function clearForm() {
@@ -1199,23 +1209,34 @@ function clearFileUpload() {
 async function uploadFile() {
   if (!selectedFile) return;
   const btn = document.getElementById('btn-upload-file');
+  const resultEl = document.getElementById('import-result-file');
   btn.disabled = true;
   btn.textContent = 'Uploading…';
+  resultEl.innerHTML = '';
   const fd = new FormData();
   fd.append('file', selectedFile);
   try {
     const res = await fetch('/api/findings/upload', { method: 'POST', body: fd });
-    const data = await res.json();
+    let data;
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      data = await res.json();
+    } else {
+      const text = await res.text();
+      const msg = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+      throw new Error('Server error ' + res.status + ': ' + msg);
+    }
     if (data.error) {
-      document.getElementById('import-result-file').innerHTML = `<div class="alert alert-error">✗ ${data.error}</div>`;
+      resultEl.innerHTML = '<div class="alert alert-error">\u2717 ' + data.error + '</div>';
     } else {
       await loadAll();
-      document.getElementById('import-result-file').innerHTML =
-        `<div class="alert alert-success">✓ Added ${data.added} findings (${data.skipped} skipped). Total: ${data.total}</div>`;
+      resultEl.innerHTML =
+        '<div class="alert alert-success">\u2713 Added ' + data.added + ' findings (' + data.skipped + ' skipped). Total: ' + data.total + '.' +
+        ' <span style="font-size:11px;opacity:.8">Clusters updating in background\u2026</span></div>';
       clearFileUpload();
     }
   } catch(e) {
-    document.getElementById('import-result-file').innerHTML = `<div class="alert alert-error">✗ Upload failed: ${e.message}</div>`;
+    resultEl.innerHTML = '<div class="alert alert-error">\u2717 Upload failed: ' + e.message + '</div>';
   }
   btn.textContent = 'Import File';
   btn.disabled = false;
