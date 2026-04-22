@@ -2,9 +2,33 @@ from flask import Flask, render_template, request, jsonify
 import json
 import re
 import math
+import threading
+import io
 from collections import defaultdict
 
+# Pre-load heavy deps at startup so first upload is instant
+try:
+    import pandas as pd
+    import openpyxl  # noqa: F401 – ensures xlsx engine is available
+    _PANDAS_OK = True
+except ImportError:
+    _PANDAS_OK = False
+
 app = Flask(__name__, template_folder='.', static_folder='.', static_url_path='/')
+
+# ── Global clustering lock – prevents concurrent re-clustering races ──────────
+_cluster_lock = threading.Lock()
+_cluster_thread = None  # reference to any in-flight background thread
+
+
+# ── Flask error handlers – always return JSON, never HTML ────────────────────
+@app.errorhandler(400)
+@app.errorhandler(404)
+@app.errorhandler(405)
+@app.errorhandler(500)
+def json_error(e):
+    code = getattr(e, 'code', 500)
+    return jsonify({'error': str(e)}), code
 
 # ── In-memory store ───────────────────────────────────────────────────────────
 findings_db = []
@@ -485,10 +509,12 @@ def _generate_why(fids):
     )
 
 
-def run_clustering(k: int = None):
+def _do_clustering(k: int = None):
+    """Actual clustering work – runs in a background thread."""
     global clusters_db
     if not findings_db:
-        clusters_db = []
+        with _cluster_lock:
+            clusters_db = []
         return
 
     # Determine whether model_theme is available
@@ -532,15 +558,34 @@ def run_clustering(k: int = None):
 
     sorted_clusters = sorted(cluster_map.values(), key=cluster_theme_sort_key)
 
-    clusters_db = []
+    new_clusters = []
     for idx, fids in enumerate(sorted_clusters):
-        clusters_db.append({
+        new_clusters.append({
             'cluster_id': f"C{idx + 1}",
             'findings_included': fids,
             'why_grouped': _generate_why(fids),
             'semantic_signals': _top_signals(fids),
             'size': len(fids),
         })
+
+    with _cluster_lock:
+        clusters_db[:] = new_clusters
+
+
+def run_clustering(k: int = None, background: bool = True):
+    """
+    Kick off clustering.  By default runs in a daemon background thread so
+    upload/add routes return instantly.  Pass background=False for the
+    initial seed load at startup (blocking is fine there).
+    """
+    global _cluster_thread
+    if not background:
+        _do_clustering(k)
+        return
+    # Cancel any pending thread (it will finish on its own but we don't wait)
+    t = threading.Thread(target=_do_clustering, args=(k,), daemon=True)
+    _cluster_thread = t
+    t.start()
 
 
 def search_query(query: str) -> dict:
@@ -626,20 +671,21 @@ def bulk_findings():
 @app.route('/api/findings/upload', methods=['POST'])
 def upload_findings():
     """Accept an Excel (.xlsx) or CSV file and bulk-import findings."""
-    import io
-    import pandas as pd
+    if not _PANDAS_OK:
+        return jsonify({'error': 'pandas/openpyxl not installed on this server'}), 500
 
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
 
     file = request.files['file']
-    filename = file.filename.lower()
+    filename = (file.filename or '').lower()
 
     try:
+        raw = file.read()
         if filename.endswith('.xlsx') or filename.endswith('.xls'):
-            df = pd.read_excel(io.BytesIO(file.read()))
+            df = pd.read_excel(io.BytesIO(raw))
         elif filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(file.read()))
+            df = pd.read_csv(io.BytesIO(raw))
         else:
             return jsonify({'error': 'Unsupported file type. Please upload .xlsx or .csv'}), 400
     except Exception as e:
@@ -730,7 +776,9 @@ def get_clusters():
 @app.route('/api/clusters/rerun', methods=['POST'])
 def rerun_clustering():
     k = request.json.get('k') if request.json else None
-    run_clustering(k)
+    # User explicitly triggered re-cluster – run synchronously so the
+    # response reflects the updated cluster count.
+    run_clustering(k, background=False)
     return jsonify({'status': 'ok', 'clusters': len(clusters_db)})
 
 
@@ -817,7 +865,8 @@ SAMPLE_FINDINGS = [
 
 for f in SAMPLE_FINDINGS:
     findings_db.append(f)
-run_clustering()
+# Blocking at startup – we want clusters ready before first request arrives
+run_clustering(background=False)
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
