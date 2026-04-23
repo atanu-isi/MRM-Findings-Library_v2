@@ -133,9 +133,9 @@ def tokenize_with_bigrams(text: str) -> list:
 # purely by the textual content of the four fields above.  Theme is only used
 # for post-hoc label generation and k-floor anchoring.
 FIELD_WEIGHTS = {
-    'description':            6,   # Primary semantic signal — richest content
-    'business_justification': 5,   # Risk framing, regulatory context — high signal
-    'title':                  2,   # Useful hint but often generic; keep low
+    'description':            8,   # Primary semantic signal — richest content
+    'business_justification': 7,   # Risk framing, regulatory context — highest combined signal
+    'title':                  1,   # Concise but generic; minimal weight
     'suggested_remediation':  1,   # Action language; weakest discriminator
 }
 
@@ -356,67 +356,43 @@ def _silhouette_score(vectors: list, labels: list, k: int, max_sample: int = 200
     return sum(scores) / len(scores) if scores else -1.0
 
 
-# ---- Stable k-selection: theme-anchored with silhouette confirmation --------
-def _theme_purity(vectors: list, labels: list, findings: list) -> float:
-    """
-    Fraction of findings that share their cluster's dominant theme.
-    A pure cluster has all findings from the same theme.
-    Higher is better (max 1.0).
-    """
-    cluster_themes = defaultdict(list)
-    for i, (lbl, f) in enumerate(zip(labels, findings)):
-        t = normalize_theme(f.get('model_theme', ''))
-        cluster_themes[lbl].append(t)
-    purity = 0.0
-    for lbl, themes in cluster_themes.items():
-        if not themes:
+# ── Gap Statistic helper ──────────────────────────────────────────────────────
+def _inertia(vectors: list, labels: list) -> float:
+    """Within-cluster sum of cosine distances from centroid."""
+    V = len(vectors[0]) if vectors else 0
+    cluster_members = defaultdict(list)
+    for i, l in enumerate(labels):
+        cluster_members[l].append(i)
+    total = 0.0
+    for members in cluster_members.values():
+        if not members:
             continue
-        dominant_count = max(themes.count(t) for t in set(themes)) if themes else 0
-        purity += dominant_count
-    return purity / len(findings) if findings else 0.0
+        vecs = [vectors[i] for i in members]
+        c = [sum(v[d] for v in vecs) / len(vecs) for d in range(V)]
+        norm = math.sqrt(sum(x * x for x in c)) or 1.0
+        c = [x / norm for x in c]
+        total += sum(1.0 - dot(vectors[i], c) for i in members)
+    return total
 
 
-def _auto_select_k(vectors: list, n: int, theme_count: int, findings: list = None) -> int:
+def _gap_statistic(vectors: list, k_min: int, k_max: int,
+                   n_refs: int = 5, seed: int = 42) -> list:
     """
-    Stable k-selection using a composite score:
-      score = 0.5 * silhouette + 0.5 * theme_purity - 0.003 * k
-
-    The theme-purity term anchors k near the number of distinct themes,
-    preventing the cluster count from changing when new findings are added
-    (as long as they belong to existing themes).
-
-    k_floor = max(theme_count, 2) ensures we never produce fewer clusters
-    than there are distinct themes in the corpus.
+    Compute Gap(k) = E[log W_k^ref] - log W_k for each k in [k_min, k_max].
+    Reference distributions are uniform on the unit hypercube (after PCA-aligned
+    bounding box).  Returns list of (k, gap, sdk) tuples.
     """
-    if n <= 2:
-        return 1
-    if n <= 3:
-        return 2
+    import random
+    rng = random.Random(seed)
+    n = len(vectors)
+    V = len(vectors[0]) if vectors else 1
 
-    # Hard floor: never fewer clusters than distinct themes (semantic anchoring)
-    k_floor = max(2, theme_count) if theme_count else 2
-
-    if n <= 10:
-        k_min, k_max = k_floor, min(n - 1, max(k_floor + 2, 5))
-    elif n <= 30:
-        k_min, k_max = k_floor, min(n // 2, max(k_floor + 3, 8))
-    elif n <= 100:
-        k_min, k_max = k_floor, min(n // 4, max(k_floor + 4, 12))
-    else:
-        k_min, k_max = k_floor, min(n // 8, max(k_floor + 5, 20))
-
-    k_max = max(k_max, k_min + 1)
-
-    best_k, best_score = k_min, -float('inf')
-    no_improve = 0
+    # Compute actual inertias
+    actual_log_w = {}
     prev_clusters = [list(range(n))]
-
-    for k in range(k_min, k_max + 1):
-        # Grow cluster list incrementally (reuse previous work)
+    for k in range(2, k_max + 1):
         while len(prev_clusters) < k:
-            V = len(vectors[0])
-
-            def inertia_of(idx_list, _V=V):
+            def _inertia_of(idx_list, _V=V):
                 if len(idx_list) <= 1:
                     return 0.0
                 vecs = [vectors[i] for i in idx_list]
@@ -425,44 +401,166 @@ def _auto_select_k(vectors: list, n: int, theme_count: int, findings: list = Non
                 c = [x / norm for x in c]
                 return sum(1.0 - dot(vectors[i], c) for i in idx_list)
 
-            target_idx = max(range(len(prev_clusters)),
-                             key=lambda j: inertia_of(prev_clusters[j]))
-            target = prev_clusters[target_idx]
-            if len(target) < 2:
+            tidx = max(range(len(prev_clusters)), key=lambda j: _inertia_of(prev_clusters[j]))
+            tgt = prev_clusters[tidx]
+            if len(tgt) < 2:
                 break
-            sub_vecs = [vectors[i] for i in target]
-            lbls, _ = kmeans(sub_vecs, 2, max_iter=50, n_restarts=2,
-                             seed=42 + len(prev_clusters) * 17)
+            sub = [vectors[i] for i in tgt]
+            lbls, _ = kmeans(sub, 2, max_iter=50, n_restarts=2, seed=seed + len(prev_clusters) * 17)
             if not lbls:
                 break
-            ga = [target[i] for i, l in enumerate(lbls) if l == 0]
-            gb = [target[i] for i, l in enumerate(lbls) if l == 1]
+            ga = [tgt[i] for i, l in enumerate(lbls) if l == 0]
+            gb = [tgt[i] for i, l in enumerate(lbls) if l == 1]
             if not ga or not gb:
                 break
-            prev_clusters.pop(target_idx)
+            prev_clusters.pop(tidx)
+            prev_clusters.extend([ga, gb])
+
+        if len(prev_clusters) >= k:
+            labels = [0] * n
+            for lbl, idx_list in enumerate(prev_clusters):
+                for i in idx_list:
+                    labels[i] = lbl
+            w = _inertia(vectors, labels)
+            actual_log_w[k] = math.log(w + 1e-10)
+
+    # Reference distribution bounds (per dimension)
+    bounds = [(min(v[d] for v in vectors), max(v[d] for v in vectors)) for d in range(V)]
+
+    results = []
+    for k in range(k_min, k_max + 1):
+        if k not in actual_log_w:
+            continue
+        ref_log_ws = []
+        for b in range(n_refs):
+            ref = [[rng.uniform(lo, hi) for lo, hi in bounds] for _ in range(n)]
+            # L2-normalise reference vectors
+            ref_norm = []
+            for rv in ref:
+                nm = math.sqrt(sum(x * x for x in rv)) or 1.0
+                ref_norm.append([x / nm for x in rv])
+            rlbls, _ = bisecting_kmeans(ref_norm, k, seed=seed + b * 97 + k * 13)
+            if not rlbls:
+                rlbls = [0] * n
+            ref_log_ws.append(math.log(_inertia(ref_norm, rlbls) + 1e-10))
+        e_log_w = sum(ref_log_ws) / len(ref_log_ws)
+        sdk = math.sqrt(sum((x - e_log_w) ** 2 for x in ref_log_ws) / len(ref_log_ws))
+        sdk *= math.sqrt(1 + 1.0 / n_refs)
+        gap = e_log_w - actual_log_w[k]
+        results.append((k, gap, sdk))
+
+    return results
+
+
+def _auto_select_k(vectors: list, n: int, theme_count: int, findings: list = None) -> int:
+    """
+    Auto-select k using Gap Statistic + Silhouette combined score.
+
+    Gap statistic finds k where the gap between reference and actual inertia
+    is maximised (Tibshirani 2001 rule: largest k where gap(k) >= gap(k+1) - sdk(k+1)).
+    Silhouette confirms geometric cluster separation quality.
+    Combined score = 0.55 * normalised_gap + 0.45 * silhouette - 0.002 * k
+
+    model_theme is NOT used as a clustering signal — no theme-anchoring.
+    """
+    if n <= 2:
+        return 1
+    if n <= 3:
+        return 2
+
+    k_min = 2
+    if n <= 10:
+        k_max = min(n - 1, 6)
+    elif n <= 30:
+        k_max = min(n // 2, 10)
+    elif n <= 100:
+        k_max = min(n // 4, 15)
+    else:
+        k_max = min(n // 8, 25)
+
+    k_max = max(k_max, k_min + 1)
+
+    # Silhouette scores via bisecting k-means (reuse incremental build)
+    sil_scores = {}
+    prev_clusters = [list(range(n))]
+    V = len(vectors[0]) if vectors else 1
+
+    for k in range(k_min, k_max + 1):
+        while len(prev_clusters) < k:
+            def _io(idx_list, _V=V):
+                if len(idx_list) <= 1:
+                    return 0.0
+                vecs = [vectors[i] for i in idx_list]
+                c = [sum(v[d] for v in vecs) / len(vecs) for d in range(_V)]
+                nm = math.sqrt(sum(x * x for x in c)) or 1.0
+                c = [x / nm for x in c]
+                return sum(1.0 - dot(vectors[i], c) for i in idx_list)
+
+            tidx = max(range(len(prev_clusters)), key=lambda j: _io(prev_clusters[j]))
+            tgt = prev_clusters[tidx]
+            if len(tgt) < 2:
+                break
+            sub = [vectors[i] for i in tgt]
+            lbls, _ = kmeans(sub, 2, max_iter=50, n_restarts=2, seed=42 + len(prev_clusters) * 17)
+            if not lbls:
+                break
+            ga = [tgt[i] for i, l in enumerate(lbls) if l == 0]
+            gb = [tgt[i] for i, l in enumerate(lbls) if l == 1]
+            if not ga or not gb:
+                break
+            prev_clusters.pop(tidx)
             prev_clusters.extend([ga, gb])
 
         if len(prev_clusters) < k:
             break
-
         labels = [0] * n
         for lbl, idx_list in enumerate(prev_clusters):
             for i in idx_list:
                 labels[i] = lbl
+        sil_scores[k] = _silhouette_score(vectors, labels, k)
 
-        sil = _silhouette_score(vectors, labels, k)
-        purity = _theme_purity(vectors, labels, findings or []) if findings else 0.5
-        # Composite: silhouette measures geometric quality, purity measures
-        # semantic coherence; tiny penalty discourages unnecessary splits
-        score = 0.50 * sil + 0.50 * purity - 0.003 * k
+    if not sil_scores:
+        return k_min
 
-        if score > best_score + 0.003:
+    # Gap statistic
+    gap_results = _gap_statistic(vectors, k_min, k_max, n_refs=5)
+    gap_map = {k: (gap, sdk) for k, gap, sdk in gap_results}
+
+    # Gap statistic Tibshirani rule: smallest k where gap(k) >= gap(k+1) - sdk(k+1)
+    gap_k = k_min
+    for k, gap, sdk in gap_results[:-1]:
+        next_k, next_gap, next_sdk = gap_results[gap_results.index((k, gap, sdk)) + 1]
+        if gap >= next_gap - next_sdk:
+            gap_k = k
+            break
+    else:
+        if gap_results:
+            gap_k = max(gap_results, key=lambda x: x[1])[0]
+
+    # Normalise gap values for combination
+    all_gaps = [g for _, g, _ in gap_results]
+    g_min, g_max = min(all_gaps), max(all_gaps)
+    g_range = (g_max - g_min) or 1.0
+
+    # Combined score: gap quality + silhouette separation - complexity penalty
+    best_k, best_score = k_min, -float('inf')
+    for k in sil_scores:
+        if k not in gap_map:
+            continue
+        gap_norm = (gap_map[k][0] - g_min) / g_range
+        sil = sil_scores[k]
+        score = 0.55 * gap_norm + 0.45 * sil - 0.002 * k
+        if score > best_score:
             best_score, best_k = score, k
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= 3:
-                break
+
+    # Soft nudge toward gap_k if close in score (avoids erratic jumps)
+    if gap_k in sil_scores and gap_k in gap_map:
+        gap_norm = (gap_map[gap_k][0] - g_min) / g_range
+        gap_k_score = 0.55 * gap_norm + 0.45 * sil_scores[gap_k] - 0.002 * gap_k
+        best_norm = (gap_map[best_k][0] - g_min) / g_range
+        best_score_val = 0.55 * best_norm + 0.45 * sil_scores.get(best_k, 0) - 0.002 * best_k
+        if abs(gap_k_score - best_score_val) < 0.05:
+            best_k = gap_k
 
     return best_k
 
@@ -566,8 +664,8 @@ def _generate_why(fids: list, label: str = '') -> str:
     label_str = f" Semantic label: '{label}'." if label else ''
     return (
         f"Findings {', '.join(fids)} share overlapping vocabulary and risk focus"
-        f"{theme_str}{label_str} Bisecting K-Means on sublinear TF-IDF vectors "
-        "(description×6 + business justification×5 + title×2 + remediation×1, "
+        f"{theme_str}{label_str} Gap Statistic + Silhouette auto-k selection on sublinear TF-IDF vectors "
+        "(description×8 + business justification×7 + title×1 + remediation×1, "
         "with bigrams) detected strong semantic similarity purely from finding content — "
         "model_theme is not used as a clustering signal."
     )
@@ -676,14 +774,32 @@ def search_query(query: str) -> dict:
 
     sims = [(dot(q_vec, dv), i) for i, dv in enumerate(doc_vecs)]
     sims.sort(reverse=True)
-    top_findings = [findings_db[i] for _, i in sims[:5]]
-    top_ids = {f['finding_id'] for f in top_findings}
 
-    best_cluster, best_count = None, 0
+    # Find best cluster: the one whose findings have the highest average similarity
+    fid_to_sim = {findings_db[i]['finding_id']: score for score, i in sims}
+    best_cluster, best_avg = None, -1.0
     for c in clusters_db:
-        overlap = len(set(c['findings_included']) & top_ids)
-        if overlap > best_count:
-            best_count, best_cluster = overlap, c
+        members = c['findings_included']
+        if not members:
+            continue
+        avg = sum(fid_to_sim.get(fid, 0.0) for fid in members) / len(members)
+        if avg > best_avg:
+            best_avg, best_cluster = avg, c
+
+    # Top Related Findings = only findings inside the best matched cluster,
+    # sorted by their individual similarity to the query
+    if best_cluster:
+        cluster_fid_set = set(best_cluster['findings_included'])
+        fid_lookup = {f['finding_id']: f for f in findings_db}
+        cluster_findings = [
+            (fid_to_sim.get(fid, 0.0), fid_lookup[fid])
+            for fid in best_cluster['findings_included']
+            if fid in fid_lookup
+        ]
+        cluster_findings.sort(reverse=True, key=lambda x: x[0])
+        top_findings = [f for _, f in cluster_findings]
+    else:
+        top_findings = [findings_db[i] for _, i in sims[:5]]
 
     return {
         'cluster': best_cluster,
