@@ -449,7 +449,7 @@ code{background:var(--bg);border:1px solid var(--border);border-radius:3px;paddi
     <div class="panel" id="panel-clusters">
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap">
         <div style="flex:1">
-          <p class="note">Findings are automatically grouped by semantic similarity using content-weighted TF-IDF (bigrams) + Bisecting K-Means. The optimal cluster count is determined automatically via <strong>Gap Statistic + Silhouette</strong> — no theme anchoring or fixed k assumed. Gap statistic compares actual inertia against reference distributions; silhouette measures geometric separation. Combined score: 0.55×gap + 0.45×silhouette − 0.002k. You can also override k manually below.</p>
+          <p class="note">Findings are automatically grouped by semantic similarity using content-weighted TF-IDF (bigrams) + Bisecting K-Means. The optimal cluster count is determined automatically via <strong>Gap Statistic + Silhouette</strong>. Gap statistic compares actual inertia against reference distributions; silhouette measures geometric separation. Combined score: 0.55×gap + 0.45×silhouette − 0.002k. You can also override k manually below.</p>
         </div>
         <div style="display:flex;gap:8px;align-items:center">
           <label style="font-size:12px;white-space:nowrap;font-weight:500;color:var(--text-secondary)">k clusters:</label>
