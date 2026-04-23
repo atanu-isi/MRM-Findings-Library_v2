@@ -130,15 +130,14 @@ def tokenize_with_bigrams(text: str) -> list:
 #   title               — concise summary but often generic phrasing; useful
 #                         but should not dominate over the full-text fields
 #   suggested_remediation — action verbs, process steps; weakest discriminator
-#
-# model_theme is NOT used as a clustering signal at all — clustering is driven
-# purely by the textual content of the four fields above.  Theme is only used
-# for post-hoc label generation and k-floor anchoring.
+#   model_theme         — short canonical label; low weight but provides a
+#                         light grouping signal when themes differ clearly
 FIELD_WEIGHTS = {
     'description':            8,   # Primary semantic signal — richest content
     'business_justification': 7,   # Risk framing, regulatory context — highest combined signal
     'title':                  1,   # Concise but generic; minimal weight
     'suggested_remediation':  1,   # Action language; weakest discriminator
+    'model_theme':            2,   # Canonical theme label — low but non-zero signal
 }
 
 
@@ -667,9 +666,8 @@ def _generate_why(fids: list, label: str = '') -> str:
     return (
         f"Findings {', '.join(fids)} share overlapping vocabulary and risk focus"
         f"{theme_str}{label_str} Gap Statistic + Silhouette auto-k selection on sublinear TF-IDF vectors "
-        "(description×8 + business justification×7 + title×1 + remediation×1, "
-        "with bigrams) detected strong semantic similarity purely from finding content — "
-        "model_theme is not used as a clustering signal."
+        "(description×8 + business justification×7 + title×1 + remediation×1 + model_theme×2, "
+        "with bigrams) detected strong semantic similarity purely from finding content."
     )
 
 
