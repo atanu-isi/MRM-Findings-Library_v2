@@ -220,27 +220,34 @@ textarea.csv-paste{min-height:160px;font-family:var(--font-mono);font-size:12px;
 .page-info{font-size:12px;color:var(--muted);font-family:var(--font-mono)}
 
 /* ── Pipeline ── */
-.pipeline{display:flex;align-items:center;gap:0;overflow-x:auto;padding:16px 2px 16px;scrollbar-width:thin}
+.pipeline{display:flex;align-items:stretch;gap:0;padding:16px 0;width:100%}
 .pipe-step{
-  flex:0 0 180px;
-  width:180px;
-  height:190px;
+  flex:1 1 0;
+  min-width:0;
   background:#fff;
   border:1px solid var(--border);
   border-radius:12px;
-  padding:18px 16px 16px;
-  box-shadow:0 2px 6px rgba(0,0,0,.06);
-  transition:box-shadow .18s,border-color .18s,transform .18s;
-  display:flex;flex-direction:column;
+  padding:20px 14px 18px;
+  box-shadow:0 2px 8px rgba(0,0,0,.06);
+  display:flex;flex-direction:column;align-items:center;text-align:center;
   box-sizing:border-box;
 }
-.pipe-step:hover{box-shadow:0 6px 18px rgba(0,0,0,.1);border-color:var(--primary-light);transform:translateY(-3px)}
-.pipe-step-icon-wrap{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;flex-shrink:0}
-.pipe-step-num{font-family:var(--font-mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;margin-bottom:5px;flex-shrink:0}
-.pipe-step-label{font-size:12.5px;font-weight:600;color:var(--text);line-height:1.35;margin-bottom:5px;flex-shrink:0}
-.pipe-step-desc{font-size:10.5px;color:var(--muted);line-height:1.5;font-family:var(--font-mono);flex:1;overflow:hidden}
-.pipe-connector{flex-shrink:0;width:36px;height:2px;background:var(--border-strong);position:relative;align-self:center}
-.pipe-connector::after{content:'▶';position:absolute;right:-9px;top:-7px;font-size:11px;color:var(--border-strong);line-height:1}
+.pipe-step-icon-wrap{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;flex-shrink:0}
+.pipe-step-num{font-family:var(--font-mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.13em;margin-bottom:6px;flex-shrink:0}
+.pipe-step-label{font-size:12px;font-weight:600;color:var(--text);line-height:1.35;flex-shrink:0}
+.pipe-step-desc{display:none}
+.pipe-connector{
+  flex:0 0 48px;
+  display:flex;align-items:center;justify-content:center;
+  align-self:center;
+}
+.pipe-connector-line{
+  position:relative;width:100%;height:2px;background:var(--border-strong);
+}
+.pipe-connector-line::after{
+  content:'►';position:absolute;right:-10px;top:50%;transform:translateY(-50%);
+  font-size:13px;color:var(--border-strong);line-height:1;
+}
 
 /* ── Animations ── */
 @keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
@@ -442,7 +449,7 @@ code{background:var(--bg);border:1px solid var(--border);border-radius:3px;paddi
     <div class="panel" id="panel-clusters">
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap">
         <div style="flex:1">
-          <p class="note">Findings are automatically grouped by semantic similarity using TF-IDF + K-Means clustering. The optimal number of clusters is determined automatically using silhouette analysis — no fixed cluster count is assumed. For large datasets (1000+ findings), the algorithm dynamically selects the k that maximises cohesion and separation. You can also override k manually below.</p>
+          <p class="note">Findings are automatically grouped by semantic similarity using content-weighted TF-IDF (bigrams) + Bisecting K-Means. The optimal cluster count is determined automatically via <strong>Gap Statistic + Silhouette</strong> — no theme anchoring or fixed k assumed. Gap statistic compares actual inertia against reference distributions; silhouette measures geometric separation. Combined score: 0.55×gap + 0.45×silhouette − 0.002k. You can also override k manually below.</p>
         </div>
         <div style="display:flex;gap:8px;align-items:center">
           <label style="font-size:12px;white-space:nowrap;font-weight:500;color:var(--text-secondary)">k clusters:</label>
@@ -956,7 +963,7 @@ function renderDashboard() {
   const pipeSteps = [
     {
       label:'Content-Weighted Ingestion',
-      desc:'Description×6, Business Justification×5, Title×2, Remediation×1 — no theme signal used',
+      desc:'Description×8, Business Justification×7, Title×1, Remediation×1 — model theme excluded from clustering signal',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`,
       bg:'#E6F3F7', color:'#005E7C', arrow:true
     },
@@ -967,9 +974,9 @@ function renderDashboard() {
       bg:'#FDF1EA', color:'#EA6C36', arrow:true
     },
     {
-      label:'Theme-Anchored k-Selection',
-      desc:'k ≥ distinct themes; score = 0.5×silhouette + 0.5×theme-purity − 0.003k',
-      icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3m0 12v3M3 12h3m12 0h3m-2.6-7.4-2.1 2.1M8.7 15.3 6.6 17.4M17.4 17.4l-2.1-2.1M8.7 8.7 6.6 6.6"/></svg>`,
+      label:'Gap Stat + Silhouette Auto-k',
+      desc:'score = 0.55×gap(normalised) + 0.45×silhouette − 0.002k; no theme anchoring',
+      icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>`,
       bg:'#EBF8FF', color:'#2B6CB0', arrow:true
     },
     {
@@ -980,7 +987,7 @@ function renderDashboard() {
     },
     {
       label:'Semantic Label Output',
-      desc:'Dominant theme (post-hoc) + discriminative bigrams → human-readable cluster label',
+      desc:'Dominant theme (post-hoc only) + discriminative bigrams → human-readable cluster label',
       icon:`<svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>`,
       bg:'#FFFFF0', color:'#D69E2E', arrow:false
     },
@@ -992,9 +999,8 @@ function renderDashboard() {
       </div>
       <div class="pipe-step-num" style="color:${s.color}">Step ${i+1}</div>
       <div class="pipe-step-label">${s.label}</div>
-      <div class="pipe-step-desc">${s.desc}</div>
     </div>
-    ${s.arrow ? `<div class="pipe-connector"></div>` : ''}`).join('');
+    ${s.arrow ? `<div class="pipe-connector"><div class="pipe-connector-line"></div></div>` : ''}`).join('');
 }
 // ── Findings Library ──────────────────────────────────────────────────────
 function renderFindings() {
@@ -1106,7 +1112,6 @@ async function doSearch() {
     <div class="search-result-card">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap">
         <span class="tag c-bg-${ci} c-color-${ci}" style="font-size:12px;font-weight:600">${res.cluster.cluster_id}</span>
-        <span class="score-badge">similarity ${res.score}</span>
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px">
         ${res.cluster.findings_included.map(f => `<span class="tag tag-id" style="font-size:10px">${f}</span>`).join('')}
