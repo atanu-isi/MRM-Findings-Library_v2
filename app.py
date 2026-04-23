@@ -97,6 +97,8 @@ THEME_GROUPS = {
     'performance':           'performance_monitoring',
     'model implementation':  'implementation',
     'implementation':        'implementation',
+    'model validation':      'model_validation',
+    'validation':            'model_validation',
 }
 
 def normalize_theme(theme: str) -> str:
@@ -710,7 +712,7 @@ def _do_clustering(k: int = None):
 
         # Sort clusters by dominant MRM theme for stable, readable labelling
         theme_order = ['data_quality', 'documentation', 'governance',
-                       'methodology', 'performance_monitoring', 'implementation']
+                       'methodology', 'performance_monitoring', 'implementation', 'model_validation']
         fid_lookup = {f['finding_id']: f for f in findings_db}
 
         def theme_sort_key(fids):
@@ -1061,6 +1063,11 @@ SAMPLE_FINDINGS = [
      "description": "Model code and associated artifacts are not maintained in a controlled versioning system. Changes are not systematically logged, reviewed, or approved. There is no audit trail of modifications to model logic or parameters.",
      "business_justification": "Lack of version control increases operational risk and reduces traceability, making it difficult to investigate issues or demonstrate compliance during audits and regulatory reviews.",
      "suggested_remediation": "- Implement a version control system (e.g., Git with a protected main branch) for all model code, configuration files, and associated artefacts with mandatory commit messages and pull request reviews\n- Enforce a change management policy requiring documented approval for all modifications to model logic, parameters, or preprocessing steps\n- Maintain a change log capturing what was changed, by whom, when, and with what approval — linked to the relevant governance decision\n- Introduce automated CI/CD pipeline checks that prevent unapproved code from being promoted to production environments\n- Conduct a retrospective audit of recent production changes and remediate any that lack documentation or approval records\n- Provide training to model development and implementation teams on version control standards and change management obligations"},
+    {"finding_id": "F013", "model_theme": "Model Validation",
+     "title": "Lack of Independent and Comprehensive Model Validation",
+     "description": "The model has not undergone a sufficiently independent or comprehensive validation exercise. Validation activities appear to have been conducted by individuals who were involved in model development, compromising independence. Furthermore, the scope of validation was limited and did not cover all key areas, including conceptual soundness, data integrity, performance testing, implementation verification, and ongoing monitoring adequacy. No formal validation report has been issued, and identified weaknesses have not been tracked to remediation.",
+     "business_justification": "Independent validation is a fundamental control to identify and mitigate model risk. Without adequate validation, model deficiencies may go undetected, increasing the risk of errors in risk measurement, financial reporting, or strategic decisions. Regulatory frameworks, including SR 11-7 and EBA Guidelines on internal models, require that validation be conducted independently and comprehensively. Non-compliance with these expectations may trigger remediation requirements, capital add-ons, or restrictions on model use.",
+     "suggested_remediation": "- Establish a formal model validation function with documented independence requirements, ensuring validators have no involvement in model development or ongoing use\n- Define a comprehensive validation scope covering all key dimensions: conceptual soundness, data integrity, performance testing, implementation verification, sensitivity analysis, and monitoring adequacy\n- Conduct a full independent validation exercise and issue a formal validation report with findings, risk ratings, and recommended actions\n- Implement a finding-tracking mechanism to log all validation weaknesses, assign owners, set remediation deadlines, and report progress to the model risk governance forum\n- Align the validation framework with SR 11-7 and applicable EBA Guidelines on internal models, documenting how each regulatory requirement is addressed\n- Establish a periodic revalidation schedule based on model risk tier (e.g., annual for Tier 1 models) and trigger-based revalidation criteria (e.g., material model changes, significant portfolio shifts, or performance breaches)"},
 ]
 
 for f in SAMPLE_FINDINGS:
