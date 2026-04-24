@@ -999,6 +999,68 @@ def stats():
     })
 
 
+
+# ── LLM proxy – uses Groq (free) with OpenAI-compatible API ─────────────────
+# Get your FREE key at https://console.groq.com  (no credit card required)
+# Paste your key into the GROQ_API_KEY variable below — no environment setup needed
+# ── Paste your Groq API key here ─────────────────────────────────────────────
+# Get a free key at https://console.groq.com (no credit card required)
+GROQ_API_KEY = "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"
+
+@app.route('/api/llm', methods=['POST'])
+def llm_proxy():
+    """
+    Accepts: { "system": "...", "user": "..." }
+    Calls Groq API (free) and returns { "text": "..." }
+    API key is set directly in the GROQ_API_KEY variable above.
+    """
+    import urllib.request as urlreq
+
+    api_key = GROQ_API_KEY.strip()
+    if not api_key:
+        return jsonify({'error': 'GROQ_API_KEY is empty — paste your key into index.py'}), 500
+
+    body = request.json or {}
+    system_prompt = body.get('system', '')
+    user_msg      = body.get('user', '')
+
+    if not user_msg:
+        return jsonify({'error': 'user message is required'}), 400
+
+    # Groq uses OpenAI-compatible chat/completions format
+    messages = []
+    if system_prompt:
+        messages.append({'role': 'system', 'content': system_prompt})
+    messages.append({'role': 'user', 'content': user_msg})
+
+    payload = json.dumps({
+        'model': 'llama-3.3-70b-versatile',   # free, fast, high quality
+        'max_tokens': 800,
+        'temperature': 0.3,
+        'messages': messages
+    }).encode()
+
+    req = urlreq.Request(
+        'https://api.groq.com/openai/v1/chat/completions',
+        data=payload,
+        headers={
+            'Content-Type':  'application/json',
+            'Authorization': f'Bearer {api_key}',
+        },
+        method='POST'
+    )
+
+    try:
+        with urlreq.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        text = data['choices'][0]['message']['content']
+        return jsonify({'text': text})
+    except urlreq.HTTPError as e:
+        err_body = e.read().decode(errors='replace')
+        return jsonify({'error': f'Groq API error {e.code}: {err_body}'}), 502
+    except Exception as e:
+        return jsonify({'error': str(e)}), 502
+
 # ── Seed with sample data on first run ───────────────────────────────────────
 SAMPLE_FINDINGS = [
     {"finding_id": "F001", "model_theme": "Modelling Input Data",
