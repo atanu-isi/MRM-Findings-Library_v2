@@ -262,6 +262,10 @@ textarea.csv-paste{min-height:160px;font-family:var(--font-mono);font-size:12px;
 /* ── Divider ── */
 .section-divider{height:1px;background:var(--border);margin:20px 0}
 
+/* ── LLM section body ── */
+.llm-section-body{min-height:60px;padding:2px 0}
+.llm-pane{animation:fadeIn .2s ease}
+
 /* ── Misc ── */
 code{background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary)}
 .note{font-size:12px;color:var(--muted);line-height:1.6}
@@ -476,6 +480,40 @@ code{background:var(--bg);border:1px solid var(--border);border-radius:3px;paddi
             <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
             Search
           </button>
+          <button class="btn btn-outline" id="llm-btn" onclick="doLLMAnalysis()" title="Ask AI for a deeper analysis using the matched findings">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 6v6l4 2"/><circle cx="19" cy="5" r="3" fill="currentColor" stroke="none"/></svg>
+            AI Analyse
+          </button>
+        </div>
+        <!-- LLM output card (hidden until used) -->
+        <div id="llm-result" style="display:none;margin-top:14px">
+          <div class="card" style="border:1.5px solid #C5D5F5;background:linear-gradient(135deg,#F0F7FF,#EAF3FA)">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid #C5D5F5">
+              <div style="width:32px;height:32px;border-radius:8px;background:var(--primary);display:flex;align-items:center;justify-content:center;flex-shrink:0">
+                <svg width="15" height="15" fill="none" stroke="#fff" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+              </div>
+              <div style="flex:1">
+                <div style="font-family:var(--font-mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--primary)">AI-Generated Analysis</div>
+                <div style="font-size:11px;color:var(--muted);margin-top:1px" id="llm-meta">Click AI Analyse to generate</div>
+              </div>
+              <span id="llm-spinner" style="display:none;width:14px;height:14px;border-radius:50%;border:2px solid var(--primary);border-top-color:transparent;animation:spin .7s linear infinite;flex-shrink:0"></span>
+            </div>
+            <!-- 3 feature tabs -->
+            <div class="tab-bar" style="margin-bottom:14px" id="llm-tab-bar">
+              <button class="tab active" onclick="switchLLMTab('remediation')">Suggested Remediations</button>
+              <button class="tab" onclick="switchLLMTab('regulatory')">Regulatory Guidelines</button>
+              <button class="tab" onclick="switchLLMTab('validation')">Validation Checks</button>
+            </div>
+            <div id="llm-pane-remediation" class="llm-pane">
+              <div id="llm-text-remediation" class="llm-section-body"><span style="color:var(--muted);font-size:12px">Click AI Analyse to generate…</span></div>
+            </div>
+            <div id="llm-pane-regulatory" class="llm-pane" style="display:none">
+              <div id="llm-text-regulatory" class="llm-section-body"><span style="color:var(--muted);font-size:12px">Click AI Analyse to generate…</span></div>
+            </div>
+            <div id="llm-pane-validation" class="llm-pane" style="display:none">
+              <div id="llm-text-validation" class="llm-section-body"><span style="color:var(--muted);font-size:12px">Click AI Analyse to generate…</span></div>
+            </div>
+          </div>
         </div>
         <p style="font-size:11px;color:var(--muted);margin-bottom:8px;font-family:var(--font-mono)">SUGGESTED QUERIES</p>
         <div class="suggestions">
@@ -1099,10 +1137,26 @@ async function rerunClustering() {
 // ── Search ────────────────────────────────────────────────────────────────
 function setSearch(q) { document.getElementById('search-input').value = q; doSearch(); }
 
+function switchResultTab(tid, pane) {
+  const bar = document.getElementById(tid + '-bar');
+  if (bar) bar.querySelectorAll('.tab').forEach(btn => {
+    const label = btn.textContent.trim().toLowerCase();
+    btn.classList.toggle('active', label.startsWith(pane) || (pane==='remediation' && label.startsWith('rem')));
+  });
+  ['finding','remediation','regulatory'].forEach(p => {
+    const el = document.getElementById(tid + '-' + p);
+    if (el) el.style.display = p === pane ? '' : 'none';
+  });
+}
+
 async function doSearch() {
   const q = document.getElementById('search-input').value.trim();
   if (!q) return;
   const res = await apiFetch('/api/search', {method:'POST', body:JSON.stringify({query:q})});
+  _lastSearchResults = res; // cache for LLM analysis
+  // Reset LLM panel on new search
+  const llmBox = document.getElementById('llm-result');
+  if (llmBox) { llmBox.style.display = 'none'; }
   const zone = document.getElementById('search-results');
   if (!res.cluster && !res.findings.length) {
     zone.innerHTML = '<div class="empty"><div class="empty-icon">⊘</div><p>No matches found. Try different keywords.</p></div>';
@@ -1121,27 +1175,244 @@ async function doSearch() {
       <p style="margin-top:10px;font-size:12px;color:var(--muted)">${res.cluster.why_grouped}</p>
     </div>` : '<p style="color:var(--muted);font-size:13px">No direct cluster match found.</p>';
 
-  const findHTML = res.findings.map(f => {
-    const remCount = f.suggested_remediation ? f.suggested_remediation.split('\n').filter(l=>l.trim()).length : 0;
+  const REGULATORY_MAP = {
+    'Model Documentation': [
+      {code:'SR 11-7 §IV', text:'Model documentation must describe the model\'s purpose, design, theory, and limitations.'},
+      {code:'EBA GL 2023/05 §5.3', text:'Technical documentation should cover data inputs, assumptions, and potential limitations.'},
+      {code:'SS1/23 §7.2', text:'PRA expects firms to maintain documentation adequate to support independent review.'},
+    ],
+    'Model Governance': [
+      {code:'SR 11-7 §II', text:'Effective model risk management requires a sound model governance framework.'},
+      {code:'OCC 2011-12 §3', text:'Governance responsibilities must be clearly assigned across model lifecycle stages.'},
+      {code:'EBA GL 2023/05 §6.1', text:'Institutions must establish a model risk management framework including ownership, oversight, and controls.'},
+    ],
+    'Model Methodology': [
+      {code:'SR 11-7 §III-A', text:'Conceptual soundness review must evaluate whether the theory underlying the model is sound.'},
+      {code:'EBA GL 2023/05 §5.1', text:'Validation should assess the theoretical/conceptual framework and methodological choices.'},
+      {code:'BCBS d192 §3.2', text:'Internal model validation should cover the quality of model design and assumptions.'},
+    ],
+    'Model Performance': [
+      {code:'SR 11-7 §III-C', text:'Ongoing monitoring must include backtesting and benchmarking to assess model performance.'},
+      {code:'EBA GL 2023/05 §7.1', text:'Performance monitoring should use outcome analysis and appropriate statistical tests.'},
+      {code:'CRR Art. 185', text:'Institutions shall conduct regular backtesting and benchmarking of internal rating systems.'},
+    ],
+    'Model Implementation': [
+      {code:'SR 11-7 §III-B', text:'Outcomes analysis and ongoing monitoring should verify consistent implementation.'},
+      {code:'EBA GL 2023/05 §5.4', text:'Validation should verify the model is implemented as intended and outputs are correctly used.'},
+      {code:'SS1/23 §7.4', text:'PRA expects adequate controls to ensure production models match approved specifications.'},
+    ],
+    'Modelling Input Data': [
+      {code:'SR 11-7 §III-A', text:'Input data quality is critical — data integrity testing must be part of validation.'},
+      {code:'EBA GL 2023/05 §5.2', text:'Data quality checks should cover completeness, accuracy, representativeness, and timeliness.'},
+      {code:'BCBS d192 §4.1', text:'Banks must ensure data used in internal models is accurate, complete, and appropriate.'},
+    ],
+    'Model Validation': [
+      {code:'SR 11-7 §III', text:'Model validation must be conducted by qualified staff independent of development.'},
+      {code:'EBA GL 2023/05 §4.2', text:'Validation must be independent from model development and carried out on a periodic basis.'},
+      {code:'CRR Art. 185', text:'Institutions shall have a robust system to validate accuracy and consistency of rating systems.'},
+    ],
+  };
+
+  function getRegulatoryRefs(theme) {
+    if (!theme) {
+      return [
+        {code:'SR 11-7', text:'Federal Reserve guidance covering model risk management across all model types.'},
+        {code:'EBA GL 2023/05', text:'EBA guidelines on internal governance including model risk management.'},
+      ];
+    }
+    return REGULATORY_MAP[theme] || REGULATORY_MAP['Model Governance'];
+  }
+
+  const findHTML = res.findings.map((f, idx) => {
+    const remLines = f.suggested_remediation ? f.suggested_remediation.split('\n').filter(l=>l.trim()) : [];
+    const remCount = remLines.length;
+    const tid = 'sr-tabs-' + idx;
+    const regRefs = getRegulatoryRefs(f.model_theme);
     return `
-    <div class="finding-item" style="cursor:pointer" onclick="openFindingModal('${f.finding_id}')">
+    <div class="finding-item">
       <div class="fi-header">
-        <span class="tag tag-id">${f.finding_id}</span>
+        <span class="tag tag-id" style="cursor:pointer" onclick="openFindingModal('${f.finding_id}')">${f.finding_id}</span>
+        ${f.model_theme ? `<span class="tag tag-success" style="font-size:10px">${f.model_theme}</span>` : ''}
         ${remCount ? `<span class="rem-badge" style="font-size:10px">✓ ${remCount} remediation steps</span>` : ''}
       </div>
-      <div class="fi-title">${f.title}</div>
-      <div class="fi-desc">${f.description}</div>
+      <div class="fi-title" style="cursor:pointer" onclick="openFindingModal('${f.finding_id}')">${f.title}</div>
+      <div style="margin-top:10px">
+        <div class="tab-bar" style="margin-bottom:10px" id="${tid}-bar">
+          <button class="tab active" onclick="switchResultTab('${tid}','finding')">Finding</button>
+          ${remCount ? `<button class="tab" onclick="switchResultTab('${tid}','remediation')">Remediation <span style="font-size:10px;opacity:.7">(${remCount})</span></button>` : ''}
+          <button class="tab" onclick="switchResultTab('${tid}','regulatory')">Regulatory Guidelines</button>
+        </div>
+        <div id="${tid}-finding" class="sr-tab-pane">
+          <div class="fi-desc" style="-webkit-line-clamp:unset;overflow:visible">${f.description}</div>
+        </div>
+        ${remCount ? `<div id="${tid}-remediation" class="sr-tab-pane" style="display:none">
+          <div class="remediation-section">
+            <h4><span class="rem-badge">Action Required</span> Suggested Remediation</h4>
+            <ul class="remediation-list">
+              ${remLines.map(line => {
+                const text = line.replace(/^[-•*]\s*/,'').trim();
+                return text ? `<li><span>${text}</span></li>` : '';
+              }).join('')}
+            </ul>
+          </div>
+        </div>` : ''}
+        <div id="${tid}-regulatory" class="sr-tab-pane" style="display:none">
+          <div style="display:flex;flex-direction:column;gap:8px">
+            ${regRefs.map(r => `<div style="display:flex;gap:10px;align-items:flex-start;padding:9px 12px;background:var(--primary-bg);border:1px solid #C5D5F5;border-radius:6px;border-left:3px solid var(--primary)">
+              <span style="font-family:var(--font-mono);font-size:10px;font-weight:700;color:var(--primary);white-space:nowrap;margin-top:2px">${r.code}</span>
+              <span style="font-size:12px;color:var(--text-secondary);line-height:1.55">${r.text}</span>
+            </div>`).join('')}
+          </div>
+        </div>
+      </div>
     </div>`;}).join('');
+
+  // Score badge helper
+  const scoreHTML = (score) => score > 0 ? `<span class="score-badge" style="margin-left:auto">${(score*100).toFixed(0)}% match</span>` : '';
 
   zone.innerHTML = `
     <div class="card" style="margin-bottom:16px">
+      <div class="card-header">
+        <div class="card-title"><span class="card-title-bar"></span>Top Related Findings</div>
+        ${scoreHTML(res.score)}
+      </div>
+      ${findHTML}
+    </div>
+    <div class="card" style="margin-bottom:16px">
       <div class="card-header"><div class="card-title"><span class="card-title-bar green"></span>Best Cluster Match</div></div>
       ${clHTML}
-    </div>
-    <div class="card">
-      <div class="card-header"><div class="card-title"><span class="card-title-bar"></span>Top Related Findings</div></div>
-      ${findHTML}
     </div>`;
+}
+
+// ── LLM Analysis ─────────────────────────────────────────────────────────
+let _lastSearchResults = null; // cached from last doSearch call
+
+// Switch between the 3 feature tabs
+function switchLLMTab(pane) {
+  ['remediation', 'regulatory', 'validation'].forEach(p => {
+    const el = document.getElementById('llm-pane-' + p);
+    if (el) el.style.display = (p === pane) ? '' : 'none';
+  });
+  const bar = document.getElementById('llm-tab-bar');
+  if (bar) {
+    const order = ['remediation', 'regulatory', 'validation'];
+    bar.querySelectorAll('.tab').forEach((btn, i) => {
+      btn.classList.toggle('active', order[i] === pane);
+    });
+  }
+}
+
+// Render plain text from the LLM into styled HTML rows
+function renderLLMSection(elId, text) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (!text || !text.trim()) {
+    el.innerHTML = '<span style="color:var(--muted);font-size:12px">No content returned.</span>';
+    return;
+  }
+  const rows = text.trim().split('\n').map(line => {
+    line = line.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    if (/^\d+\.\s+/.test(line)) {
+      const num = line.match(/^(\d+)\.\s+/)[1];
+      const body = line.replace(/^\d+\.\s+/, '');
+      return `<div style="display:flex;gap:10px;padding:7px 0;border-bottom:1px solid rgba(0,94,124,.07)">
+        <span style="font-family:var(--font-mono);font-size:10px;font-weight:700;color:var(--primary);background:var(--primary-bg);border:1px solid #C5D5F5;border-radius:4px;padding:1px 6px;flex-shrink:0;align-self:flex-start;margin-top:2px">${num}</span>
+        <span style="font-size:12.5px;color:var(--text-secondary);line-height:1.6">${body}</span>
+      </div>`;
+    }
+    if (/^[-•*]\s+/.test(line)) {
+      const body = line.replace(/^[-•*]\s+/, '');
+      return `<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(0,94,124,.07)">
+        <span style="color:var(--accent);font-weight:700;flex-shrink:0;margin-top:1px">→</span>
+        <span style="font-size:12.5px;color:var(--text-secondary);line-height:1.55">${body}</span>
+      </div>`;
+    }
+    if (!line.trim()) return '<div style="height:5px"></div>';
+    return `<p style="font-size:12.5px;color:var(--text-secondary);line-height:1.6;padding:3px 0">${line}</p>`;
+  });
+  el.innerHTML = rows.join('');
+}
+
+// Show a loading spinner inside a pane
+function setLLMPaneLoading(pane) {
+  const el = document.getElementById('llm-text-' + pane);
+  if (el) el.innerHTML = `<div style="display:flex;align-items:center;gap:8px;padding:12px 0;color:var(--muted);font-size:12px">
+    <span style="width:10px;height:10px;border-radius:50%;border:2px solid var(--primary);border-top-color:transparent;animation:spin .7s linear infinite;display:inline-block;flex-shrink:0"></span>
+    Generating…
+  </div>`;
+}
+
+// Single LLM call helper — proxied through Flask backend to avoid CORS
+// Uses Groq free API (https://console.groq.com) via /api/llm on the server
+async function callLLM(systemPrompt, userMsg) {
+  const response = await fetch('/api/llm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ system: systemPrompt, user: userMsg })
+  });
+  const data = await response.json();
+  if (data.error) throw new Error(data.error);
+  return data.text || '';
+}
+
+async function doLLMAnalysis() {
+  const q = document.getElementById('search-input').value.trim();
+  if (!q) { showAlert('Please run a search first then click AI Analyse', 'info'); return; }
+
+  const box     = document.getElementById('llm-result');
+  const spinner = document.getElementById('llm-spinner');
+  const meta    = document.getElementById('llm-meta');
+
+  // Show the card and spinner
+  box.style.display = 'block';
+  spinner.style.display = 'inline-block';
+  if (meta) meta.textContent = 'Generating…';
+
+  // Mark all panes as loading
+  setLLMPaneLoading('remediation');
+  setLLMPaneLoading('regulatory');
+  setLLMPaneLoading('validation');
+  switchLLMTab('remediation');
+
+  // Build findings context from last search (up to 5 findings)
+  const findings = (_lastSearchResults && _lastSearchResults.findings)
+    ? _lastSearchResults.findings.slice(0, 5)
+    : allFindings.slice(0, 5);
+
+  const clusterLabel = (_lastSearchResults && _lastSearchResults.cluster && _lastSearchResults.cluster.semantic_label)
+    ? _lastSearchResults.cluster.semantic_label : '';
+
+  // Compact context string shared across all 3 calls
+  const findingLines = findings.map(f =>
+    `[${f.finding_id}] ${f.title} (Theme: ${f.model_theme || 'N/A'})\nDescription: ${f.description.substring(0, 350)}`
+  ).join('\n\n');
+
+  const context = `User query: "${q}"${clusterLabel ? '\nCluster theme: ' + clusterLabel : ''}\n\nTop matched MRM findings:\n${findingLines}`;
+
+  const baseSystem = 'You are a senior Model Risk Management (MRM) expert. Be concise and practical. Respond with ONLY a plain numbered or bulleted list — no intro sentence, no headers, no markdown fences.';
+
+  // Run 3 independent calls in parallel
+  const [remResult, regResult, valResult] = await Promise.allSettled([
+    callLLM(
+      baseSystem,
+      `${context}\n\nProvide 4-6 numbered remediation action steps to address these MRM findings. Each step must be specific and actionable.`
+    ),
+    callLLM(
+      baseSystem,
+      `${context}\n\nList 3-5 applicable regulatory guidelines relevant to these findings. For each, cite the specific regulation (e.g. SR 11-7 Section III, EBA GL 2023/05 §5.3, OCC 2011-12, PRA SS1/23, BCBS d192) and briefly state what it requires.`
+    ),
+    callLLM(
+      baseSystem,
+      `${context}\n\nList 4-6 specific validation checks that should be performed to assess and verify these MRM findings. Each check must describe a concrete test or review activity.`
+    )
+  ]);
+
+  spinner.style.display = 'none';
+  if (meta) meta.textContent = `Based on ${findings.length} matched finding${findings.length !== 1 ? 's' : ''}`;
+
+  renderLLMSection('llm-text-remediation', remResult.status === 'fulfilled' ? remResult.value : 'Error: ' + remResult.reason?.message);
+  renderLLMSection('llm-text-regulatory',  regResult.status === 'fulfilled' ? regResult.value : 'Error: ' + regResult.reason?.message);
+  renderLLMSection('llm-text-validation',  valResult.status === 'fulfilled' ? valResult.value : 'Error: ' + valResult.reason?.message);
 }
 
 // ── Global search ────────────────────────────────────────────────────────
@@ -1190,9 +1461,35 @@ async function addFinding() {
     business_justification: document.getElementById('f-just').value.trim(),
     suggested_remediation: document.getElementById('f-rem').value.trim(),
   };
-  if (!data.finding_id || !data.title || !data.description || !data.business_justification) {
-    showAlert('All fields are required', 'error'); return;
+  // ── Validation checks ────────────────────────────────────────────────
+  const errors = [];
+  if (!data.finding_id) errors.push('Finding ID is required');
+  else if (!/^[A-Za-z0-9_\-]{1,20}$/.test(data.finding_id)) errors.push('Finding ID must be 1-20 alphanumeric characters (letters, numbers, hyphens, underscores)');
+  else if (allFindings.some(f => f.finding_id === data.finding_id)) errors.push('Finding ID "' + data.finding_id + '" already exists');
+  if (!data.title) errors.push('Title is required');
+  else if (data.title.length < 5) errors.push('Title must be at least 5 characters');
+  else if (data.title.length > 200) errors.push('Title must be 200 characters or fewer');
+  if (!data.description) errors.push('Description is required');
+  else if (data.description.length < 20) errors.push('Description must be at least 20 characters');
+  if (!data.business_justification) errors.push('Business Justification is required');
+  else if (data.business_justification.length < 10) errors.push('Business Justification must be at least 10 characters');
+  if (errors.length) {
+    showAlert(errors[0], 'error');
+    // Highlight first invalid field
+    const fieldMap = {
+      'Finding ID': 'f-id', 'Title': 'f-title', 'Description': 'f-desc', 'Business Justification': 'f-just'
+    };
+    for (const [label, id] of Object.entries(fieldMap)) {
+      const el = document.getElementById(id);
+      if (el) el.style.borderColor = errors.some(e => e.includes(label)) ? 'var(--accent)' : '';
+    }
+    return;
   }
+  // Clear error highlights
+  ['f-id','f-title','f-desc','f-just'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.borderColor = '';
+  });
   try {
     const res = await apiFetch('/api/findings', {method:'POST', body:JSON.stringify(data)});
     if (res.error) { showAlert(res.error, 'error'); return; }
