@@ -765,8 +765,19 @@ def search_query(query: str) -> dict:
     if not clusters_db or not findings_db:
         return {'cluster': None, 'findings': [], 'score': 0}
 
-    # Vectorise findings + query together so IDF is computed over the same corpus
-    query_tc = {tok: 1.0 for tok in tokenize(query)}
+    # Vectorise findings + query together so IDF is computed over the same corpus.
+    # Use tokenize_with_bigrams so the query benefits from the same bigram
+    # representation used by documents — covers all five fields including
+    # Model Theme, Description, Business Justification, Title, Suggested Remediation.
+    raw_query_tokens = tokenize_with_bigrams(query)
+    query_tc = {tok: 1.0 for tok in raw_query_tokens}
+
+    # Boost query against model_theme vocabulary for direct theme matching
+    for theme_key, theme_label in THEME_GROUPS.items():
+        if any(part in query.lower() for part in theme_key.split()):
+            for tok in tokenize_with_bigrams(theme_key + ' ' + theme_label):
+                query_tc[tok] = query_tc.get(tok, 0) + 0.5
+
     all_tcs = [weighted_token_counts(f) for f in findings_db] + [query_tc]
     vectors, _, _ = build_tfidf(all_tcs)
     q_vec = vectors[-1]
@@ -1000,25 +1011,19 @@ def stats():
 
 
 
-# ── LLM proxy – uses Groq (free) with OpenAI-compatible API ─────────────────
-# Get your FREE key at https://console.groq.com  (no credit card required)
-# Paste your key into the GROQ_API_KEY variable below — no environment setup needed
-# ── Paste your Groq API key here ─────────────────────────────────────────────
-# Get a free key at https://console.groq.com (no credit card required)
-GROQ_API_KEY = "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"
-
+# ── LLM proxy – forwards requests to local Ollama instance ──────────────────
 @app.route('/api/llm', methods=['POST'])
 def llm_proxy():
     """
     Accepts: { "system": "...", "user": "..." }
-    Calls Groq API (free) and returns { "text": "..." }
-    API key is set directly in the GROQ_API_KEY variable above.
-    """
-    import urllib.request as urlreq
+    Forwards to local Ollama API (http://localhost:11434) and returns { "text": "..." }
 
-    api_key = GROQ_API_KEY.strip()
-    if not api_key:
-        return jsonify({'error': 'GROQ_API_KEY is empty — paste your key into index.py'}), 500
+    Ollama must be running locally with at least one model pulled, e.g.:
+        ollama pull llama3
+    The model name can be overridden via the OLLAMA_MODEL env variable.
+    The Ollama host can be overridden via OLLAMA_HOST (default: http://localhost:11434).
+    """
+    import os, urllib.request as urlreq
 
     body = request.json or {}
     system_prompt = body.get('system', '')
@@ -1027,37 +1032,47 @@ def llm_proxy():
     if not user_msg:
         return jsonify({'error': 'user message is required'}), 400
 
-    # Groq uses OpenAI-compatible chat/completions format
+    # Allow overriding model and host via environment variables
+    ollama_host  = os.environ.get('OLLAMA_HOST', 'http://localhost:11434').rstrip('/')
+    ollama_model = os.environ.get('OLLAMA_MODEL', 'haybu/mistral-latest:latest')
+
+    # Build messages list — Ollama chat API uses the same OpenAI-style format
     messages = []
     if system_prompt:
         messages.append({'role': 'system', 'content': system_prompt})
     messages.append({'role': 'user', 'content': user_msg})
 
     payload = json.dumps({
-        'model': 'llama-3.3-70b-versatile',   # free, fast, high quality
-        'max_tokens': 800,
-        'temperature': 0.3,
-        'messages': messages
+        'model':  ollama_model,
+        'messages': messages,
+        'stream': False,
+        'options': {
+            'num_predict': 200,   # equivalent to max_tokens
+            'temperature': 0.3,
+        }
     }).encode()
 
     req = urlreq.Request(
-        'https://api.groq.com/openai/v1/chat/completions',
+        f'{ollama_host}/api/chat',
         data=payload,
-        headers={
-            'Content-Type':  'application/json',
-            'Authorization': f'Bearer {api_key}',
-        },
+        headers={'Content-Type': 'application/json'},
         method='POST'
     )
 
     try:
-        with urlreq.urlopen(req, timeout=60) as resp:
+        with urlreq.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read())
-        text = data['choices'][0]['message']['content']
+        # Ollama chat response: data['message']['content']
+        text = (data.get('message') or {}).get('content', '')
+        if not text:
+            # Fallback: older generate endpoint shape
+            text = data.get('response', '')
         return jsonify({'text': text})
     except urlreq.HTTPError as e:
         err_body = e.read().decode(errors='replace')
-        return jsonify({'error': f'Groq API error {e.code}: {err_body}'}), 502
+        return jsonify({'error': f'Ollama API error {e.code}: {err_body}'}), 502
+    except ConnectionRefusedError:
+        return jsonify({'error': 'Ollama is not running. Start it with: ollama serve'}), 502
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
